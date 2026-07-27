@@ -6273,6 +6273,45 @@ async def test_heartbeat_mutates_schedule_wakeup_countdown() -> None:
     assert action_state.action.detail["countdown_s"] >= 0
 
 
+def test_heartbeat_tick_bumps_for_silent_engine_past_60s() -> None:
+    """#481 B1.1: silent engines with zero open actions still refresh past 60s.
+
+    Regression coverage for the `self._silent_engine and now - self.started_at
+    > 60.0` branch in `_heartbeat_tick` — found untested during code review
+    (the only other test setting `_silent_engine = True` never advances the
+    clock past 100ms).
+    """
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._silent_engine = True
+    edits.started_at = 100.0  # _make_edits hardcodes 0.0; align to the clock
+
+    seq_before = edits.event_seq
+    clock.set(159.0)  # 59s elapsed — branch must not fire yet
+    edits._heartbeat_tick()
+    assert edits.event_seq == seq_before
+
+    clock.set(160.1)  # 60.1s elapsed — branch fires
+    edits._heartbeat_tick()
+    assert edits.event_seq == seq_before + 1
+
+
+def test_heartbeat_tick_does_not_bump_for_non_silent_engine_past_60s() -> None:
+    """The silent-engine branch must stay inert for streaming engines."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    assert edits._silent_engine is False
+
+    seq_before = edits.event_seq
+    clock.set(200.0)  # 100s elapsed, but not a silent engine
+    edits._heartbeat_tick()
+    assert edits.event_seq == seq_before
+
+
 # ---------------------------------------------------------------------------
 # #481 B1.2 — silent-engine liveness meta line
 # ---------------------------------------------------------------------------

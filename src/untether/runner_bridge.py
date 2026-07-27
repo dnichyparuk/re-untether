@@ -1019,6 +1019,14 @@ class ProgressEdits:
         self._outline_sent: bool = False
         self._outline_refs: list[MessageRef] = []
         self._stall_notice_refs: list[MessageRef] = []
+        # Guards _stall_notice_refs against a real race: _stall_monitor can
+        # append a ref (after an in-flight transport.send()) concurrently
+        # with on_event()'s recovery cleanup or delete_ephemeral()'s
+        # safety-net drain, both of which iterate-then-clear the same list.
+        # Without this lock, a ref appended between "iterate" and "clear"
+        # is dropped from the list but its Telegram message is never
+        # deleted — an orphaned stall-warning message (found in review).
+        self._stall_notice_refs_lock = anyio.Lock()
         self._outline_just_resolved: bool = False
         self.signal_send, self.signal_recv = anyio.create_memory_object_stream(1)
 
@@ -1789,9 +1797,10 @@ class ProgressEdits:
                         ),
                     )
                     if ref is not None:
-                        self._stall_notice_refs.append(ref)
-                        if len(self._stall_notice_refs) > 20:
-                            self._stall_notice_refs.pop(0)
+                        async with self._stall_notice_refs_lock:
+                            self._stall_notice_refs.append(ref)
+                            if len(self._stall_notice_refs) > 20:
+                                self._stall_notice_refs.pop(0)
                 except Exception:  # noqa: BLE001
                     logger.debug(
                         "progress_edits.stall_notify_failed",
@@ -2518,9 +2527,10 @@ class ProgressEdits:
     # that. handle_message() overrides this to the run's resolved silence
     # budget (e.g. AntigravityRunner.expected_silence_budget_s()) plus
     # _SILENT_ENGINE_STALL_MARGIN_S. 900.0 (15 min) is only the fallback used
-    # when the runner has no budget hook.
+    # when the runner has no budget hook, or the hook returns None (e.g.
+    # print_timeout unset/unparseable).
     _STALL_THRESHOLD_SILENT_ENGINE: float = (
-        900.0  # 15 minutes; fallback when no budget hook
+        900.0  # 15 minutes; fallback when no budget hook or hook returns None
     )
     # #526 rc20 follow-up: two-tier threshold for approval-pending stalls.
     # First reminder fires at 600 s so users get a reassuring "tap a button
@@ -2561,15 +2571,17 @@ class ProgressEdits:
             # Keep _prev_diag so next stall episode has a CPU baseline
             self._frozen_ring_count = 0
             self._prev_recent_events = None
-            if self._stall_notice_refs:
-                for ref in self._stall_notice_refs:
+            async with self._stall_notice_refs_lock:
+                refs_to_delete = list(self._stall_notice_refs)
+                self._stall_notice_refs.clear()
+            if refs_to_delete:
+                for ref in refs_to_delete:
                     with contextlib.suppress(Exception):
                         await self.transport.delete(ref=ref)
                 logger.debug(
                     "progress_edits.stall_notices_deleted",
-                    count=len(self._stall_notice_refs),
+                    count=len(refs_to_delete),
                 )
-                self._stall_notice_refs.clear()
         # Clear stuck-after-tool_result episode state (#322) on any event —
         # covers both organic recovery and Tier 2 recovery where SIGTERM'ing
         # the adapter lets the engine resume. Outside the stall-recovered
@@ -2690,15 +2702,17 @@ class ProgressEdits:
         self._outline_refs.clear()
         # Safety-net: delete any stall-warning notices not already cleaned up
         # (e.g. run cancelled/completed while a stall warning is visible).
-        for ref in self._stall_notice_refs:
+        async with self._stall_notice_refs_lock:
+            refs_to_delete = list(self._stall_notice_refs)
+            self._stall_notice_refs.clear()
+        for ref in refs_to_delete:
             with contextlib.suppress(Exception):
                 await self.transport.delete(ref=ref)
-        if self._stall_notice_refs:
+        if refs_to_delete:
             logger.debug(
                 "progress_edits.stall_notices_deleted",
-                count=len(self._stall_notice_refs),
+                count=len(refs_to_delete),
             )
-        self._stall_notice_refs.clear()
         # Drain messages registered by callback handlers (e.g. approve/deny feedback).
         if self.progress_ref is not None:
             key = (self.channel_id, self.progress_ref.message_id)
@@ -3169,6 +3183,10 @@ async def handle_message(
             err_body = f"\N{ELECTRIC LIGHT BULB} {hint}\n\n```\n{err_body}\n```"
         else:
             err_body = f"```\n{err_body}\n```"
+        # #481 B1.2: drop the silent-engine liveness line before rendering —
+        # an error message must not show a stale "process alive" diagnostic.
+        if progress_tracker.meta is not None:
+            progress_tracker.meta.pop("liveness", None)
         state = progress_tracker.snapshot(
             resume_formatter=runner.format_resume,
             context_line=context_line,
@@ -3220,6 +3238,11 @@ async def handle_message(
             resume=resume.value if resume else None,
             elapsed_s=elapsed,
         )
+        # #481 B1.2: drop the silent-engine liveness line before rendering —
+        # a cancelled-run message must not show a stale "process alive"
+        # diagnostic left over from a mid-run stall-monitor tick.
+        if progress_tracker.meta is not None:
+            progress_tracker.meta.pop("liveness", None)
         state = progress_tracker.snapshot(
             resume_formatter=runner.format_resume,
             context_line=context_line,
