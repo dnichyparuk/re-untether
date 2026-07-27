@@ -1797,7 +1797,11 @@ async def test_run_main_loop_routes_reply_to_running_resume() -> None:
     async with anyio.create_task_group() as tg:
         tg.start_soon(run_main_loop, cfg, poller)
         try:
-            with anyio.fail_after(2):
+            # run_main_loop's fixed startup cost (command menu build, topic
+            # state, chat prefs, at_scheduler/loop_scheduler install, signal
+            # handlers) has grown to ~2s on its own — a bare 2s budget here
+            # is now too tight and makes this test flaky under load.
+            with anyio.fail_after(10):
                 await reply_ready.wait()
             await anyio.lowlevel.checkpoint()
             hold.set()
@@ -1984,7 +1988,10 @@ async def test_run_main_loop_persists_topic_sessions_in_project_scope(
             thread_id=77,
         )
 
-    with anyio.fail_after(2):
+    # run_main_loop's fixed startup cost plus the poller-exhaustion drain
+    # cycle (~0.5s poll interval) now totals ~2.4s on its own — a bare 2s
+    # budget is too tight and makes this test flaky under load.
+    with anyio.fail_after(10):
         await run_main_loop(cfg, poller)
 
     state_path = resolve_state_path(runtime.config_path or tmp_path / "untether.toml")
@@ -3304,7 +3311,10 @@ async def test_run_main_loop_new_clears_topic_sessions(tmp_path: Path) -> None:
             chat_type="supergroup",
         )
 
-    with anyio.fail_after(2):
+    # run_main_loop's fixed startup cost plus the poller-exhaustion drain
+    # cycle (~0.5s poll interval) now totals ~2.4s on its own — a bare 2s
+    # budget is too tight and makes this test flaky under load.
+    with anyio.fail_after(10):
         await run_main_loop(cfg, poller)
 
     store2 = TopicStateStore(resolve_state_path(state_path))

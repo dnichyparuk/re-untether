@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 
@@ -28,6 +28,9 @@ from .transport import (
     ThreadId,
     Transport,
 )
+
+if TYPE_CHECKING:
+    from .utils.proc_diag import ProcessDiag
 
 logger = get_logger(__name__)
 
@@ -870,6 +873,9 @@ class RunningTask:
     cancel_requested: anyio.Event = field(default_factory=anyio.Event)
     done: anyio.Event = field(default_factory=anyio.Event)
     context: RunContext | None = None
+    engine: str | None = None
+    started_at: float = 0.0
+    pid: int | None = None
 
 
 RunningTasks = dict[MessageRef, RunningTask]
@@ -963,6 +969,8 @@ class ProgressEdits:
         self.context_line = context_line
         self.thread_id = thread_id
         self._approval_notified: bool = False
+        self._silent_engine: bool = False
+        self._silence_budget_s: float | None = None
         self._approval_notify_ref: MessageRef | None = None
         self._min_render_interval = min_render_interval
         self._sleep = sleep
@@ -1010,6 +1018,15 @@ class ProgressEdits:
         self.rendered_seq = 0
         self._outline_sent: bool = False
         self._outline_refs: list[MessageRef] = []
+        self._stall_notice_refs: list[MessageRef] = []
+        # Guards _stall_notice_refs against a real race: _stall_monitor can
+        # append a ref (after an in-flight transport.send()) concurrently
+        # with on_event()'s recovery cleanup or delete_ephemeral()'s
+        # safety-net drain, both of which iterate-then-clear the same list.
+        # Without this lock, a ref appended between "iterate" and "clear"
+        # is dropped from the list but its Telegram message is never
+        # deleted — an orphaned stall-warning message (found in review).
+        self._stall_notice_refs_lock = anyio.Lock()
         self._outline_just_resolved: bool = False
         self.signal_send, self.signal_recv = anyio.create_memory_object_stream(1)
 
@@ -1107,6 +1124,12 @@ class ProgressEdits:
                 self._bump_heartbeat()
                 break
 
+        # Event-silent engines (streams_progress=False) emit zero ActionEvents,
+        # so the loop above never fires; refresh the header elapsed
+        # unconditionally once the run itself is >60s old.
+        if self._silent_engine and now - self.started_at > 60.0:
+            self._bump_heartbeat()
+
     async def _flush_pending_closing_message(self) -> None:
         """#470: send the one-shot post-result closing Telegram message.
 
@@ -1191,6 +1214,8 @@ class ProgressEdits:
                 else None
             )
             self._prev_diag = diag
+            if self._silent_engine:
+                self._update_silent_engine_liveness(elapsed, diag, cpu_active)
 
             # Use longer threshold when waiting for user approval, running a
             # tool, or when child processes are active (Agent subagents).
@@ -1214,9 +1239,9 @@ class ProgressEdits:
             elif self._has_running_tool():
                 threshold = self._STALL_THRESHOLD_TOOL
                 threshold_reason = "running_tool"
-            elif getattr(self.tracker, "engine", None) == "antigravity":
-                threshold = self._STALL_THRESHOLD_ANTIGRAVITY
-                threshold_reason = "antigravity_no_progress"
+            elif self._silent_engine:
+                threshold = self._STALL_THRESHOLD_SILENT_ENGINE
+                threshold_reason = "silent_engine_no_progress"
             else:
                 threshold = self._STALL_THRESHOLD_SECONDS
                 threshold_reason = "normal"
@@ -1764,18 +1789,57 @@ class ProgressEdits:
                 parts.append("/cancel to stop.")
                 text = "\n".join(parts)
                 try:
-                    await self.transport.send(
+                    ref = await self.transport.send(
                         channel_id=self.channel_id,
                         message=RenderedMessage(text=text),
                         options=SendOptions(
                             thread_id=self.thread_id,
                         ),
                     )
+                    if ref is not None:
+                        async with self._stall_notice_refs_lock:
+                            self._stall_notice_refs.append(ref)
+                            if len(self._stall_notice_refs) > 20:
+                                self._stall_notice_refs.pop(0)
                 except Exception:  # noqa: BLE001
                     logger.debug(
                         "progress_edits.stall_notify_failed",
                         exc_info=True,
                     )
+
+    def _update_silent_engine_liveness(
+        self, elapsed: float, diag: ProcessDiag | None, cpu_active: bool | None
+    ) -> None:
+        """Route stall-monitor diagnostics into a `meta["liveness"]` line.
+
+        Silent engines (streams_progress=False, e.g. Antigravity) emit no
+        ActionEvents, so users otherwise see no signal that the run is
+        still progressing. Reuses ``elapsed``/``diag``/``cpu_active`` already
+        computed by ``_stall_monitor`` for threshold selection — no new
+        diagnostics collection. Bumps the heartbeat only when the composed
+        string actually changes, to avoid needless re-renders.
+        """
+        parts = [f"⏱ {int(elapsed // 60)}m"]
+        if self._silence_budget_s:
+            parts[0] += f" / {int(self._silence_budget_s // 60)}m"
+        parts.append(
+            "process alive"
+            if diag and diag.alive
+            else "process exited"
+            if diag is not None
+            else "process ?"
+        )
+        if cpu_active is not None:
+            parts.append("CPU active" if cpu_active else "CPU idle")
+        text = " · ".join(parts)
+        if self.tracker.meta is None:
+            # No StartedEvent meta seeded yet (e.g. no trigger source, no
+            # resolved model/permission labels) — start fresh so `.get`/
+            # item-assignment below don't crash on None.
+            self.tracker.meta = {}
+        if self.tracker.meta.get("liveness") != text:
+            self.tracker.meta["liveness"] = text
+            self._bump_heartbeat()
 
     def _bump_heartbeat(self) -> None:
         """Wake the render loop without changing stall counters or last_event_at.
@@ -2457,14 +2521,17 @@ class ProgressEdits:
     _STALL_THRESHOLD_TOOL: float = 600.0  # 10 minutes when a tool is actively running
     _STALL_THRESHOLD_MCP_TOOL: float = 900.0  # 15 min for MCP tools (network-bound)
     _STALL_THRESHOLD_SUBAGENT: float = 900.0  # 15 min for child process / subagent work
-    # Antigravity emits zero interim ActionEvents (single terminal JSON envelope),
-    # so it would otherwise always fall to the 5-min "normal" threshold and warn
-    # on every legitimate run longer than that. 15 min matches agy's own default
-    # `--print-timeout` (antigravity.py:_DEFAULT_PRINT_TIMEOUT) so a healthy run
-    # completes before the stall warning fires. A project/global override raising
-    # print_timeout beyond 15 min will still see a stall warning before agy's own
-    # timeout — documented limitation (docs/reference/runners/antigravity/runner.md).
-    _STALL_THRESHOLD_ANTIGRAVITY: float = 900.0  # 15 minutes
+    # Silent engines (e.g. Antigravity) emit zero interim ActionEvents (single
+    # terminal JSON envelope), so they would otherwise always fall to the
+    # 5-min "normal" threshold and warn on every legitimate run longer than
+    # that. handle_message() overrides this to the run's resolved silence
+    # budget (e.g. AntigravityRunner.expected_silence_budget_s()) plus
+    # _SILENT_ENGINE_STALL_MARGIN_S. 900.0 (15 min) is only the fallback used
+    # when the runner has no budget hook, or the hook returns None (e.g.
+    # print_timeout unset/unparseable).
+    _STALL_THRESHOLD_SILENT_ENGINE: float = (
+        900.0  # 15 minutes; fallback when no budget hook or hook returns None
+    )
     # #526 rc20 follow-up: two-tier threshold for approval-pending stalls.
     # First reminder fires at 600 s so users get a reassuring "tap a button
     # above" message within the same window as a normal-tool stall (10 min)
@@ -2504,6 +2571,17 @@ class ProgressEdits:
             # Keep _prev_diag so next stall episode has a CPU baseline
             self._frozen_ring_count = 0
             self._prev_recent_events = None
+            async with self._stall_notice_refs_lock:
+                refs_to_delete = list(self._stall_notice_refs)
+                self._stall_notice_refs.clear()
+            if refs_to_delete:
+                for ref in refs_to_delete:
+                    with contextlib.suppress(Exception):
+                        await self.transport.delete(ref=ref)
+                logger.debug(
+                    "progress_edits.stall_notices_deleted",
+                    count=len(refs_to_delete),
+                )
         # Clear stuck-after-tool_result episode state (#322) on any event —
         # covers both organic recovery and Tier 2 recovery where SIGTERM'ing
         # the adapter lets the engine resume. Outside the stall-recovered
@@ -2622,6 +2700,19 @@ class ProgressEdits:
                     error_type=exc.__class__.__name__,
                 )
         self._outline_refs.clear()
+        # Safety-net: delete any stall-warning notices not already cleaned up
+        # (e.g. run cancelled/completed while a stall warning is visible).
+        async with self._stall_notice_refs_lock:
+            refs_to_delete = list(self._stall_notice_refs)
+            self._stall_notice_refs.clear()
+        for ref in refs_to_delete:
+            with contextlib.suppress(Exception):
+                await self.transport.delete(ref=ref)
+        if refs_to_delete:
+            logger.debug(
+                "progress_edits.stall_notices_deleted",
+                count=len(refs_to_delete),
+            )
         # Drain messages registered by callback handlers (e.g. approve/deny feedback).
         if self.progress_ref is not None:
             key = (self.channel_id, self.progress_ref.message_id)
@@ -2640,6 +2731,14 @@ class ProgressEdits:
                     )
         # Note: unregister_progress() is called AFTER send_result_message()
         # in handle_message(), not here, to avoid an orphan window.
+
+
+# Margin added on top of a silent engine's resolved silence budget (e.g.
+# Antigravity's effective --print-timeout) when overriding
+# ProgressEdits._STALL_THRESHOLD_SILENT_ENGINE in handle_message(). Keeps the
+# stall warning from firing just before the engine's own timeout would have
+# resolved the run.
+_SILENT_ENGINE_STALL_MARGIN_S: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2742,6 +2841,8 @@ async def run_runner_with_cancel(
                                 pid = evt.meta.get("pid")
                                 if isinstance(pid, int):
                                     edits.pid = pid
+                                    if running_task is not None:
+                                        running_task.pid = pid
                             _cs = getattr(runner, "current_stream", None)
                             if _cs is not None:
                                 edits.stream = _cs
@@ -2774,6 +2875,8 @@ async def run_runner_with_cancel(
                     pid = getattr(runner, "last_pid", None)
                     if isinstance(pid, int):
                         edits.pid = pid
+                        if running_task is not None:
+                            running_task.pid = pid
                         cs = getattr(runner, "current_stream", None)
                         if cs is not None:
                             edits.stream = cs
@@ -2976,6 +3079,15 @@ async def handle_message(
         min_render_interval=progress_cfg.min_render_interval,
     )
 
+    edits._silent_engine = not getattr(runner, "streams_progress", True)
+    budget_fn = getattr(runner, "expected_silence_budget_s", None)
+    silence_budget_s = budget_fn() if callable(budget_fn) else None
+    edits._silence_budget_s = silence_budget_s
+    if silence_budget_s:
+        edits._STALL_THRESHOLD_SILENT_ENGINE = (
+            silence_budget_s + _SILENT_ENGINE_STALL_MARGIN_S
+        )
+
     # Apply watchdog settings to runner and edits
     watchdog = _load_watchdog_settings()
     if watchdog is not None:
@@ -3009,7 +3121,9 @@ async def handle_message(
 
     running_task: RunningTask | None = None
     if running_tasks is not None and progress_ref is not None:
-        running_task = RunningTask(context=context)
+        running_task = RunningTask(
+            context=context, engine=str(runner.engine), started_at=clock()
+        )
         running_tasks[progress_ref] = running_task
 
     cancel_exc_type = anyio.get_cancelled_exc_class()
@@ -3069,6 +3183,10 @@ async def handle_message(
             err_body = f"\N{ELECTRIC LIGHT BULB} {hint}\n\n```\n{err_body}\n```"
         else:
             err_body = f"```\n{err_body}\n```"
+        # #481 B1.2: drop the silent-engine liveness line before rendering —
+        # an error message must not show a stale "process alive" diagnostic.
+        if progress_tracker.meta is not None:
+            progress_tracker.meta.pop("liveness", None)
         state = progress_tracker.snapshot(
             resume_formatter=runner.format_resume,
             context_line=context_line,
@@ -3120,6 +3238,11 @@ async def handle_message(
             resume=resume.value if resume else None,
             elapsed_s=elapsed,
         )
+        # #481 B1.2: drop the silent-engine liveness line before rendering —
+        # a cancelled-run message must not show a stale "process alive"
+        # diagnostic left over from a mid-run stall-monitor tick.
+        if progress_tracker.meta is not None:
+            progress_tracker.meta.pop("liveness", None)
         state = progress_tracker.snapshot(
             resume_formatter=runner.format_resume,
             context_line=context_line,
@@ -3372,6 +3495,12 @@ async def handle_message(
                 "Plan outline complete. Resume and say "
                 '"approved" to proceed, or send feedback to revise.'
             )
+
+    # #481 B1.2: drop the silent-engine liveness line before the final
+    # snapshot so the completed message never shows a stale "process
+    # alive" line from mid-run stall-monitor ticks.
+    if progress_tracker.meta is not None:
+        progress_tracker.meta.pop("liveness", None)
 
     state = progress_tracker.snapshot(
         resume_formatter=runner.format_resume,

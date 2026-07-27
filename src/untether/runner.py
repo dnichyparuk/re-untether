@@ -281,6 +281,7 @@ def _session_label(
 
 class BaseRunner(SessionLockMixin):
     engine: EngineId
+    streams_progress: bool = True  # False = envelope-only engine, silent until completion
 
     def run(
         self, prompt: str, resume: ResumeToken | None

@@ -60,6 +60,7 @@ from .commands.reply import make_reply
 from .context import _merge_topic_context, _usage_ctx_set, _usage_topic
 from .engine_defaults import resolve_engine_for_message
 from .engine_overrides import merge_overrides
+from .jobs import handle_jobs_command
 from .listen_mode import resolve_listen_mode, should_trigger_run
 from .new_project import handle_project_command
 from .print_timeout import handle_print_timeout_command
@@ -709,6 +710,18 @@ def _dispatch_builtin_command(
         task_group.start_soon(handler)
         return True
 
+    if command_id == "jobs":
+        handler = partial(
+            handle_jobs_command,
+            cfg,
+            msg,
+            running_tasks=ctx.running_tasks,
+            scheduler=ctx.scheduler,
+            ambient_context=ambient_context,
+        )
+        task_group.start_soon(handler)
+        return True
+
     if command_id == "agent":
         handler = partial(
             handle_agent_command,
@@ -931,6 +944,7 @@ class TelegramCommandContext:
     reply: Callable[..., Awaitable[None]]
     task_group: TaskGroup
     running_tasks: RunningTasks | None = None
+    scheduler: ThreadScheduler | None = None
     chat_session_store: ChatSessionStore | None = None
     chat_session_key: tuple[int, int | None] | None = None
 
@@ -2590,6 +2604,7 @@ async def run_main_loop(
                         reply=reply,
                         task_group=tg,
                         running_tasks=state.running_tasks,
+                        scheduler=scheduler,
                         chat_session_store=state.chat_session_store,
                         chat_session_key=chat_session_key,
                     ),
