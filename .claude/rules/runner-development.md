@@ -58,6 +58,7 @@ Do NOT construct `StartedEvent`, `ActionEvent`, `CompletedEvent` dataclasses dir
 5. Register in `pyproject.toml` entry points: `myengine = "untether.runners.myengine:BACKEND"`
 6. Add reference docs in `docs/reference/runners/myengine/`
 7. Add tests mirroring `tests/test_codex_runner.py` patterns
+8. If the engine is envelope-only (non-streaming, no live `ActionEvent`s — e.g. Antigravity), set `streams_progress = False` and optionally implement `expected_silence_budget_s()` so the bridge derives a truthful stall threshold and liveness line instead of falling back to the generic class-default threshold
 
 ## After changes
 

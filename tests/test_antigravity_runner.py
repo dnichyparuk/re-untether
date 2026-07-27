@@ -197,6 +197,29 @@ def test_build_args_no_auto_approve() -> None:
     assert "--dangerously-skip-permissions" not in args
 
 
+def test_streams_progress_is_false() -> None:
+    runner = AntigravityRunner()
+    assert runner.streams_progress is False
+
+
+def test_expected_silence_budget_s_default() -> None:
+    runner = AntigravityRunner()
+    assert runner.expected_silence_budget_s() == 900.0
+
+
+def test_expected_silence_budget_s_run_option_override() -> None:
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    runner = AntigravityRunner()
+    with apply_run_options(EngineRunOptions(print_timeout="45m")):
+        assert runner.expected_silence_budget_s() == 2700.0
+
+
+def test_expected_silence_budget_s_unparseable_returns_none() -> None:
+    runner = AntigravityRunner(print_timeout="not-a-duration")
+    assert runner.expected_silence_budget_s() is None
+
+
 def test_build_args_sanitizes_prompt() -> None:
     runner = AntigravityRunner()
     args = runner.build_args("--not-a-flag do it", None, state=None)

@@ -127,6 +127,64 @@ class TestFormatMetaLine:
         assert result == "opus 4.6 (1M) \N{MIDDLE DOT} plan"
 
 
+class TestLivenessInFooter:
+    """Liveness meta key rendering/ordering (#481 B1.2)."""
+
+    def test_liveness_only(self) -> None:
+        result = format_meta_line({"liveness": "⏱ 3m · process alive"})
+        assert result == "⏱ 3m · process alive"
+
+    def test_liveness_absent_when_unset(self) -> None:
+        result = format_meta_line({"model": "opus"})
+        assert result == "opus"
+        assert "process" not in (result or "")
+
+    def test_liveness_empty_string_ignored(self) -> None:
+        result = format_meta_line({"model": "opus", "liveness": ""})
+        assert result == "opus"
+
+    def test_liveness_non_string_ignored(self) -> None:
+        result = format_meta_line({"model": "opus", "liveness": 42})
+        assert result == "opus"
+
+    def test_liveness_after_trigger_before_complete(self) -> None:
+        result = format_meta_line(
+            {
+                "model": "opus",
+                "trigger": "⏰ cron:daily-review",
+                "liveness": "⏱ 3m/process alive",
+                "complete": "✓ turn complete",
+            }
+        )
+        assert result is not None
+        # Liveness text intentionally avoids the " · " join separator so
+        # position comparisons below aren't confused by an internal match.
+        assert result.index("⏰ cron:daily-review") < result.index(
+            "⏱ 3m/process alive"
+        )
+        assert result.index("⏱ 3m/process alive") < result.index(
+            "✓ turn complete"
+        )
+
+    def test_liveness_with_trigger_only(self) -> None:
+        result = format_meta_line(
+            {
+                "trigger": "⏰ cron:daily-review",
+                "liveness": "⏱ 3m · process alive",
+            }
+        )
+        assert result == "⏰ cron:daily-review \N{MIDDLE DOT} ⏱ 3m · process alive"
+
+    def test_liveness_with_complete_only(self) -> None:
+        result = format_meta_line(
+            {
+                "liveness": "⏱ 3m · process alive",
+                "complete": "✓ turn complete",
+            }
+        )
+        assert result == "⏱ 3m · process alive \N{MIDDLE DOT} ✓ turn complete"
+
+
 class TestProgressTrackerMeta:
     """Test that ProgressTracker stores meta from StartedEvent."""
 

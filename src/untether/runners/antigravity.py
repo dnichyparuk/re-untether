@@ -39,6 +39,7 @@ from ..runner import (
     _stderr_excerpt,
 )
 from ..schemas import antigravity as antigravity_schema
+from ..utils.durations import parse_go_duration_seconds
 from ..utils.paths import get_run_base_dir
 from .run_options import get_run_options
 
@@ -202,6 +203,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     """Runner for the Antigravity CLI (`agy`)."""
 
     engine: EngineId = ENGINE
+    streams_progress: bool = False
     resume_re: re.Pattern[str] = _RESUME_RE
     agy_cmd: str = "agy"
     model: str | None = None
@@ -232,6 +234,11 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if run_options is not None and run_options.print_timeout:
             return str(run_options.print_timeout)
         return self.print_timeout
+
+    def expected_silence_budget_s(self) -> float | None:
+        """Max healthy stdout-silence in seconds (resolved --print-timeout)."""
+        value = self._resolved_print_timeout()
+        return parse_go_duration_seconds(value) if value else None
 
     def build_args(
         self,

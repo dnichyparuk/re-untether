@@ -426,6 +426,12 @@ def format_meta_line(meta: dict[str, Any]) -> str | None:
     trigger = meta.get("trigger")
     if isinstance(trigger, str) and trigger:
         parts.append(trigger)
+    # liveness: silent-engine stall-monitor diagnostics (elapsed/budget,
+    # process alive/exited, CPU active/idle) surfaced during a run; popped
+    # before the final-message snapshot so it never appears there.
+    liveness = meta.get("liveness")
+    if isinstance(liveness, str) and liveness:
+        parts.append(liveness)
     # #333: show "✓ turn complete" hint on bidirectional Claude sessions
     # so the user knows the turn is done and the bot is waiting (rather
     # than processing). Set by translate_claude_event on result.

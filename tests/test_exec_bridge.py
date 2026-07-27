@@ -8,7 +8,7 @@ import pytest
 
 from tests.factories import action_completed, action_started
 from untether.markdown import MarkdownParts, MarkdownPresenter
-from untether.model import ResumeToken, UntetherEvent
+from untether.model import ResumeToken, StartedEvent, UntetherEvent
 from untether.progress import ProgressTracker
 from untether.runner_bridge import (
     _EPHEMERAL_MSGS,
@@ -461,6 +461,151 @@ async def test_handle_message_error_preserves_resume_token() -> None:
     assert "error" in last_edit.lower()
     assert session_id in last_edit
     assert "codex resume" in last_edit.lower()
+
+
+# ---------------------------------------------------------------------------
+# RunningTask enrichment (engine/started_at/pid) tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_running_task_engine_and_started_at_set_at_registration() -> None:
+    transport = FakeTransport()
+    session_id = "019b66fc-64c2-7a71-81cd-081c504cfeb3"
+    hold = anyio.Event()
+    runner = ScriptRunner(
+        [Wait(hold)],
+        engine=CODEX_ENGINE,
+        resume_value=session_id,
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    running_tasks: dict = {}
+    clock = _FakeClock(start=100.0)
+
+    async def run_handle_message() -> None:
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(
+                channel_id=123, message_id=10, text="do something"
+            ),
+            resume_token=None,
+            running_tasks=running_tasks,
+            clock=clock,
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_handle_message)
+        for _ in range(100):
+            if running_tasks:
+                break
+            await anyio.lowlevel.checkpoint()
+        assert running_tasks
+        running_task = running_tasks[next(iter(running_tasks))]
+        assert running_task.engine == runner.engine
+        assert running_task.started_at == 100.0
+        with anyio.fail_after(1):
+            await running_task.resume_ready.wait()
+        running_task.cancel_requested.set()
+
+
+@pytest.mark.anyio
+async def test_running_task_pid_set_from_started_event_meta() -> None:
+    transport = FakeTransport()
+    session_id = "019b66fc-64c2-7a71-81cd-081c504cfeb4"
+    hold = anyio.Event()
+    runner = ScriptRunner(
+        [
+            Emit(
+                StartedEvent(
+                    engine=CODEX_ENGINE,
+                    resume=ResumeToken(engine=CODEX_ENGINE, value=session_id),
+                    meta={"pid": 4321},
+                )
+            ),
+            Wait(hold),
+        ],
+        engine=CODEX_ENGINE,
+        resume_value=session_id,
+        emit_session_start=False,
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    running_tasks: dict = {}
+
+    async def run_handle_message() -> None:
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(
+                channel_id=123, message_id=10, text="do something"
+            ),
+            resume_token=None,
+            running_tasks=running_tasks,
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_handle_message)
+        for _ in range(100):
+            if running_tasks:
+                break
+            await anyio.lowlevel.checkpoint()
+        assert running_tasks
+        running_task = running_tasks[next(iter(running_tasks))]
+        with anyio.fail_after(1):
+            await running_task.resume_ready.wait()
+        assert running_task.pid == 4321
+        running_task.cancel_requested.set()
+
+
+@pytest.mark.anyio
+async def test_running_task_pid_set_from_thread_pid_poller() -> None:
+    transport = FakeTransport()
+    session_id = "019b66fc-64c2-7a71-81cd-081c504cfeb5"
+    hold = anyio.Event()
+    runner = ScriptRunner(
+        [Wait(hold)],
+        engine=CODEX_ENGINE,
+        resume_value=session_id,
+    )
+    runner.last_pid = 9999
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    running_tasks: dict = {}
+
+    async def run_handle_message() -> None:
+        await handle_message(
+            cfg,
+            runner=runner,
+            incoming=IncomingMessage(
+                channel_id=123, message_id=10, text="do something"
+            ),
+            resume_token=None,
+            running_tasks=running_tasks,
+        )
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_handle_message)
+        for _ in range(100):
+            if running_tasks:
+                break
+            await anyio.lowlevel.checkpoint()
+        assert running_tasks
+        running_task = running_tasks[next(iter(running_tasks))]
+        with anyio.fail_after(2):
+            while running_task.pid != 9999:
+                await anyio.sleep(0.05)
+        running_task.cancel_requested.set()
 
 
 # ---------------------------------------------------------------------------
@@ -2061,6 +2206,163 @@ async def test_progress_edits_stall_recovery_clears_warning() -> None:
 
     assert edits._stall_warned is False
     assert edits._stall_warn_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral stall-warning notice tests (Task 6 / B3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_stall_notice_ref_captured_on_warning() -> None:
+    """Stall warning sends append their MessageRef; list grows on the 2nd warning."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._stall_repeat_seconds = 0.02  # very short so a 2nd warning fires
+
+    edits._last_event_at = 100.0
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            # First warning
+            clock.set(100.1)
+            await anyio.sleep(0.05)
+            # Advance past repeat interval for second warning
+            clock.set(100.2)
+            await anyio.sleep(0.05)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert len(transport.send_calls) >= 2
+    assert len(edits._stall_notice_refs) >= 2
+    sent_refs = [c["ref"] for c in transport.send_calls]
+    assert edits._stall_notice_refs[0] == sent_refs[0]
+    assert edits._stall_notice_refs[1] == sent_refs[1]
+
+
+@pytest.mark.anyio
+async def test_stall_recovery_deletes_notice_refs() -> None:
+    """on_event's stall_recovered branch deletes all tracked stall-notice refs."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+
+    # Simulate stall state with two pending notice refs
+    edits._stall_warned = True
+    edits._stall_warn_count = 2
+    edits._last_event_at = 100.0
+    edits._stall_notice_refs = [
+        MessageRef(channel_id=123, message_id=70),
+        MessageRef(channel_id=123, message_id=71),
+    ]
+
+    # Receive a new event -> recovery
+    clock.set(200.0)
+    from untether.model import Action, ActionEvent
+
+    evt = ActionEvent(
+        engine="codex",
+        action=Action(id="x", kind="command", title="echo"),
+        phase="started",
+    )
+    await edits.on_event(evt)
+
+    assert edits._stall_warned is False
+    deleted_ids = [r.message_id for r in transport.delete_calls]
+    assert 70 in deleted_ids
+    assert 71 in deleted_ids
+    assert edits._stall_notice_refs == []
+
+
+@pytest.mark.anyio
+async def test_stall_notice_refs_deleted_in_delete_ephemeral() -> None:
+    """Safety net: delete_ephemeral() cleans up remaining stall-notice refs."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    edits = _make_edits(transport, presenter)
+
+    edits._stall_notice_refs = [
+        MessageRef(channel_id=123, message_id=60),
+        MessageRef(channel_id=123, message_id=61),
+    ]
+
+    await edits.delete_ephemeral()
+
+    deleted_ids = [r.message_id for r in transport.delete_calls]
+    assert 60 in deleted_ids
+    assert 61 in deleted_ids
+    assert edits._stall_notice_refs == []
+
+
+@pytest.mark.anyio
+async def test_stall_notice_delete_raising_does_not_stop_remaining() -> None:
+    """transport.delete() raising on one stall-notice ref still attempts the rest."""
+
+    class FlakyDeleteTransport(FakeTransport):
+        async def delete(self, *, ref: MessageRef) -> bool:
+            self.delete_calls.append(ref)
+            if ref.message_id == 90:
+                raise RuntimeError("boom")
+            return True
+
+    transport = FlakyDeleteTransport()
+    presenter = _KeyboardPresenter()
+    edits = _make_edits(transport, presenter)
+
+    edits._stall_notice_refs = [
+        MessageRef(channel_id=123, message_id=90),
+        MessageRef(channel_id=123, message_id=91),
+    ]
+
+    await edits.delete_ephemeral()
+
+    deleted_ids = [r.message_id for r in transport.delete_calls]
+    assert deleted_ids == [90, 91]
+    assert edits._stall_notice_refs == []
+
+
+@pytest.mark.anyio
+async def test_stall_notice_refs_capped_at_20() -> None:
+    """Appending a 21st stall-warning ref drops the oldest (cap stays at 20)."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.01
+    edits._stall_repeat_seconds = 0.01
+    edits._STALL_MAX_WARNINGS = 999  # avoid auto-cancel before we hit 21 sends
+    edits.event_seq = 1  # avoid the no-pid/no-events auto-cancel arm
+
+    edits._last_event_at = 100.0
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            t = 100.0
+            for _ in range(21):
+                t += 0.02
+                clock.set(t)
+                await anyio.sleep(0.02)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert len(transport.send_calls) >= 21
+    assert len(edits._stall_notice_refs) == 20
+    sent_refs = [c["ref"] for c in transport.send_calls[:21]]
+    # Oldest (1st) ref was dropped; list starts from the 2nd send.
+    assert edits._stall_notice_refs[0] == sent_refs[1]
+    assert edits._stall_notice_refs[-1] == sent_refs[20]
 
 
 @pytest.mark.anyio
@@ -4035,10 +4337,10 @@ async def test_stall_threshold_elevated_for_antigravity() -> None:
     presenter = _KeyboardPresenter()
     clock = _FakeClock(start=100.0)
     edits = _make_edits(transport, presenter, clock=clock)
-    edits.tracker.engine = "antigravity"
+    edits._silent_engine = True
     edits._stall_check_interval = 0.01
     edits._STALL_THRESHOLD_SECONDS = 0.05  # 50ms — "normal" threshold
-    edits._STALL_THRESHOLD_ANTIGRAVITY = 0.5  # 500ms
+    edits._STALL_THRESHOLD_SILENT_ENGINE = 0.5  # 500ms
     edits._stall_repeat_seconds = 0.02
 
     async with anyio.create_task_group() as tg:
@@ -5969,6 +6271,109 @@ async def test_heartbeat_mutates_schedule_wakeup_countdown() -> None:
     action_state = next(iter(edits.tracker._actions.values()))
     assert "countdown_s" in action_state.action.detail
     assert action_state.action.detail["countdown_s"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# #481 B1.2 — silent-engine liveness meta line
+# ---------------------------------------------------------------------------
+
+
+def test_update_silent_engine_liveness_bumps_heartbeat_only_on_change() -> None:
+    """_bump_heartbeat() fires only when the composed liveness string changes.
+
+    Reruns with identical (elapsed, diag, cpu_active) must be a no-op —
+    otherwise a silent-engine run would spam re-renders every stall-monitor
+    tick even though nothing changed.
+    """
+    from untether.utils.proc_diag import ProcessDiag
+
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._silence_budget_s = 900.0  # 15m
+
+    diag = ProcessDiag(pid=1, alive=True, state="S")
+
+    seq_before = edits.event_seq
+    edits._update_silent_engine_liveness(180.0, diag, True)
+    assert edits.event_seq == seq_before + 1
+    assert edits.tracker.meta is not None
+    assert edits.tracker.meta["liveness"] == "⏱ 3m / 15m · process alive · CPU active"
+
+    # Identical inputs -> unchanged text -> no additional bump.
+    edits._update_silent_engine_liveness(180.0, diag, True)
+    assert edits.event_seq == seq_before + 1
+
+    # Different elapsed -> new text -> bump fires again.
+    edits._update_silent_engine_liveness(240.0, diag, True)
+    assert edits.event_seq == seq_before + 2
+    assert "4m" in edits.tracker.meta["liveness"]
+
+
+def test_update_silent_engine_liveness_process_exited_and_unknown() -> None:
+    """diag not None but not alive -> 'process exited'; diag None -> 'process ?'."""
+    from untether.utils.proc_diag import ProcessDiag
+
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    edits = _make_edits(transport, presenter, clock=_FakeClock(start=0.0))
+
+    exited_diag = ProcessDiag(pid=1, alive=False, state="Z")
+    edits._update_silent_engine_liveness(60.0, exited_diag, None)
+    assert edits.tracker.meta["liveness"] == "⏱ 1m · process exited"
+
+    edits._update_silent_engine_liveness(60.0, None, None)
+    assert edits.tracker.meta["liveness"] == "⏱ 1m · process ?"
+
+
+@pytest.mark.anyio
+async def test_final_message_pops_liveness_before_snapshot() -> None:
+    """#481 B1.2: the completed message never shows a stale liveness line.
+
+    Simulates the stall monitor having merged meta["liveness"] into the
+    tracker mid-run (via a second StartedEvent carrying the key, the same
+    mechanism ProgressTracker.note_event uses to merge StartedEvent.meta)
+    and asserts the final rendered message's footer omits it, while other
+    meta (model) set at the same time is preserved.
+    """
+    transport = FakeTransport()
+    resume = ResumeToken(engine=CODEX_ENGINE, value="sid-liveness")
+    runner = ScriptRunner(
+        [
+            Emit(
+                StartedEvent(
+                    engine=CODEX_ENGINE,
+                    resume=resume,
+                    meta={
+                        "liveness": "⏱ 3m · process alive",
+                        "model": "gpt-5",
+                    },
+                )
+            ),
+            Return(answer="done"),
+        ],
+        engine=CODEX_ENGINE,
+        resume_value="sid-liveness",
+    )
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=False,
+    )
+
+    await handle_message(
+        cfg,
+        runner=runner,
+        incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+        resume_token=None,
+    )
+
+    # The final message replaces the progress message via edit (not a new
+    # send) when final_notify=False, so check edit_calls.
+    final_text = transport.edit_calls[-1]["message"].text
+    assert "process alive" not in final_text
+    assert "gpt-5" in final_text
 
 
 # ---------------------------------------------------------------------------
