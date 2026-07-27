@@ -189,7 +189,7 @@ Rules in `.claude/rules/` auto-load when editing matching files:
 | Rule | Applies to | Key constraints |
 |------|-----------|----------------|
 | `runner-development.md` | `runners/**`, `runner.py` | EventFactory usage, session locking, entry point registration |
-| `telegram-transport.md` | `telegram/**` | Outbox-only writes, 64-byte callback data, ephemeral cleanup |
+| `telegram-transport.md` | `telegram/**` | Outbox-only writes, 64-byte callback data, ephemeral cleanup, new-command menu wiring checklist |
 | `control-channel.md` | `runners/claude.py`, `claude_control.py` | PTY lifecycle, session registries, cooldown mechanics |
 | `testing-conventions.md` | `tests/**` | pytest+anyio, stub patterns, 80% coverage threshold |
 | `release-discipline.md` | `CHANGELOG.md`, `pyproject.toml` | GitHub issue linking, changelog format, semantic versioning |
