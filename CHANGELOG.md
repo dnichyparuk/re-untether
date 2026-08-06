@@ -7,6 +7,16 @@ fixes. For the history of the upstream project this fork is based on, see the
 [littlebearapps/untether changelog](https://github.com/littlebearapps/untether/blob/master/CHANGELOG.md)
 (fork diverged after upstream v0.35.3).
 
+## v0.38.0 (2026-07-27)
+
+### changes
+
+- **feat:** Antigravity (`agy`) process-tracking and liveness monitoring. `agy` is a non-streaming, envelope-only engine — it emits no interim `ActionEvent`s — so the generic stall monitor previously fell back to a hardcoded 900s threshold and had no way to signal "still working" during long runs. A new duck-typed `streams_progress` trait on runners (`src/untether/runner.py`) lets the bridge identify envelope-only engines without engine-name string checks; a new `expected_silence_budget_s()` runner hook (implemented on `AntigravityRunner`, `src/untether/runners/antigravity.py`) resolves the run's actual configured `print_timeout` via a new `parse_go_duration_seconds()` utility (`src/untether/utils/durations.py`), so the stall threshold is derived from the real budget plus a margin instead of a constant. Added a periodic heartbeat and a `liveness` progress-meta line (process alive/exited, CPU active/idle) so the Telegram progress bubble no longer looks frozen for silent engines (`src/untether/runner_bridge.py`, `src/untether/markdown.py`) [#11](https://github.com/dnichyparuk/re-untether/pull/11)
+- **feat:** new `/jobs` command — a read-only snapshot of in-flight work in the current chat: active runs (engine, elapsed minutes, pid + liveness), plus counts of jobs queued behind a session lock and pending `/at` delays. Follows the `/printtimeout` architecture pattern (always available, no section-enabled gate). `RunningTask` enriched with `engine`, `started_at`, and `pid` fields to back it. New module `src/untether/telegram/jobs.py`; routed in `loop.py`, reserved in `ids.py`, added to the static command menu [#11](https://github.com/dnichyparuk/re-untether/pull/11)
+  - Ephemeral stall-warning messages are now tracked (`ProgressEdits._stall_notice_refs`) and cleaned up on stall-recovery or run end instead of lingering in the chat; a lock guards the list against a race between the stall monitor appending a ref and concurrent cleanup paths clearing it, which could otherwise orphan a Telegram message.
+  - The `liveness` diagnostic is now cleared from progress meta before every terminal message (success, error, and cancelled), not just the success path — a "process alive" indicator no longer appears in final failure output.
+  - Widened three `test_telegram_bridge.py` test timeouts (2s → 10s) to match `run_main_loop`'s actual startup cost (command menu build, topic state, signal handlers, scheduler install), fixing pre-existing intermittent failures unrelated to this feature.
+
 ## v0.37.1 (2026-07-05)
 
 ### fixes
