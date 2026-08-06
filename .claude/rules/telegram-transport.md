@@ -83,6 +83,21 @@ Plan outlines render as formatted Telegram text via `render_markdown()` + `split
 
 `/new` cancels all running tasks for the chat via `_cancel_chat_tasks()` (in `commands/topics.py`) before clearing stored sessions. This prevents process leaks from orphaned Claude/engine subprocesses.
 
+## Adding a new command
+
+Two distinct paths — pick based on whether the command needs bespoke Telegram-specific access (raw `msg`, `cfg`, `running_tasks`, `scheduler`, admin/topic checks) that the plugin protocol doesn't expose.
+
+**Plugin (`CommandBackend`)** — e.g. `/planmode`, `/verbose`, `/usage`. Register in `pyproject.toml`'s `[project.entry-points."untether.command_backends"]` and implement the `CommandBackend` protocol (see `docs/reference/plugin-api.md`). `menu.py`'s `list_entrypoints()` loop auto-discovers it, auto-fills its menu description from `backend.description`, and dispatch calls `backend.handle(ctx)` generically — no manual wiring needed anywhere else.
+
+**Builtin (inline)** — e.g. `/clone`, `/project`, `/printtimeout`, `/jobs`. Requires 4 manual wiring points, or Telegram will silently never predict/autocomplete the command even though it works when typed in full:
+
+1. **`src/untether/ids.py`** — add the command name to `RESERVED_CHAT_COMMANDS`, reserving the id against engine-id/project-alias/plugin collisions.
+2. **`src/untether/telegram/loop.py`** — import the handler and add an `if command_id == "<name>":` branch inside `_dispatch_builtin_command()`, alongside `/model`/`/printtimeout`/`/jobs`.
+3. **`src/untether/telegram/commands/menu.py`** — add `("<name>", "<description>")` to `build_bot_commands()`'s static list. Only gate it behind an `include_*` flag if the command has an enable/disable config toggle (like `/clone`'s `[clone].enabled`); otherwise add it unconditionally, matching `/model`/`/printtimeout`/`/jobs`.
+4. **Nothing else to add** — `_set_command_menu()` (which calls Telegram's `setMyCommands`) already runs at process startup (`loop.py` `run_main_loop`) and on every config hot-reload (`handle_reload()`), so step 3's addition reaches Telegram automatically on the next restart.
+
+Step 4 is a restart, not a hot-reload: hot-reload only re-triggers on `untether.toml` changes, not on code changes. A code-only command addition needs the bot process itself restarted before Telegram will predict it — and even then, Telegram clients cache the per-bot command list, so closing/reopening the chat may be needed to see the update.
+
 ## After changes
 
 If this change will be released, run integration tests T1-T10 (Telegram transport), S7 (rapid-fire), S8 (long prompt) via `@untether_dev_bot`. See `docs/reference/integration-testing.md` — the "Changed area" table maps `telegram/*.py` changes to required tests.
