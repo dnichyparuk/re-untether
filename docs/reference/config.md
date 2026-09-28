@@ -601,10 +601,10 @@ interactive approval or plan mode, and no USD cost — token counts only). See t
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
-| `model` | string | (unset) | Passed as `--model`; also used as the session title. Full display name, e.g. `"Gemini 3.1 Pro (High)"` (run `agy models` for the catalog). The reasoning tier is baked into the model name — there is no separate effort flag. |
+| `model` | string | (unset) | Passed as `--model`; also used as the session title. Full display name, e.g. `"Gemini 3.1 Pro (High)"` (run `agy models` for the catalog). The reasoning tier is baked into the model name for these catalog entries; agy 1.2.11+ also has a separate top-level `--effort` flag, not currently passed by this runner. |
 | `sandbox` | bool | `false` | Pass `--sandbox` to run agy in its sandbox. |
 | `auto_approve` | bool | `true` | Pass `--dangerously-skip-permissions` for headless auto-approve. Set `false` to keep agy's own permission gating — but note agy has no interactive approval channel through Untether, so a run needing approval will stall/fail rather than prompt. |
-| `print_timeout` | string | `15m` | Pass `--print-timeout <dur>`. Untether defaults to `15m` to override agy's own `5m0s`, which otherwise cuts off long runs. Use Go duration syntax, e.g. `"30m"`. Set to `""` to omit the flag and restore agy's own `5m0s` default. |
+| `print_timeout` | string | `15m` | Pass `--print-timeout <dur>`. Untether defaults to `15m` to bound long runs. As of agy 1.2.6, agy's own built-in default (if this flag is omitted) is **unlimited** — not `5m0s` as earlier versions of this doc claimed. Use Go duration syntax, e.g. `"30m"`. Setting this to `""` omits the flag entirely, which means the run has **no timeout at all** — confirmed to let a single run balloon past 6 minutes / 600k+ tokens in practice; avoid `""` unless that's actually intended. |
 | `add_dirs` | string[] | `[]` | Extra directories exposed to agy, one `--add-dir` per entry. |
 | `extra_args` | string[] | `[]` | Extra CLI args for `agy`. Flags Untether manages internally (`-p`, `--print`, `--prompt`, `--output-format`, `--continue`/`-c`, `--conversation`, `--model`, `--dangerously-skip-permissions`, `--sandbox`, `--print-timeout`) are rejected at config-load, since several are derived from the keys above. |
 

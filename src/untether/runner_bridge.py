@@ -28,6 +28,7 @@ from .transport import (
     ThreadId,
     Transport,
 )
+from .utils.durations import parse_go_duration_seconds
 
 if TYPE_CHECKING:
     from .utils.proc_diag import ProcessDiag
@@ -1397,6 +1398,7 @@ class ProgressEdits:
             elif (
                 self.pid is None
                 and self.event_seq == 0
+                and not self._is_silent_engine_run()
                 and self._stall_warn_count >= self._STALL_MAX_WARNINGS_NO_PID
             ):
                 auto_cancel_reason = "no_pid_no_events"
@@ -1806,6 +1808,13 @@ class ProgressEdits:
                         "progress_edits.stall_notify_failed",
                         exc_info=True,
                     )
+
+    def _is_silent_engine_run(self) -> bool:
+        # Registry backstop in case _silent_engine was never set (e.g. a
+        # wrapper dropped ``streams_progress``) — see _KNOWN_SILENT_ENGINES.
+        return self._silent_engine or _is_known_silent_engine(
+            getattr(self.tracker, "engine", None)
+        )
 
     def _update_silent_engine_liveness(
         self, elapsed: float, diag: ProcessDiag | None, cpu_active: bool | None
@@ -2740,6 +2749,28 @@ class ProgressEdits:
 # resolved the run.
 _SILENT_ENGINE_STALL_MARGIN_S: float = 60.0
 
+# Fallback only: the primary signal is the runner's `streams_progress = False`
+# (see handle_message below). Protects known envelope-only engines if a
+# future wrapper stops forwarding runner capabilities. Keep in sync with
+# runner classes — enforced by test_known_silent_engines_matches_runner_declarations.
+_KNOWN_SILENT_ENGINES: frozenset[str] = frozenset({"antigravity"})
+
+# Duplicate of runners/antigravity.py:_DEFAULT_PRINT_TIMEOUT, kept local so this
+# module stays engine-agnostic (no imports of engine-specific runner modules).
+# Sync enforced by test_silent_engine_fallback_timeout_matches_antigravity_default.
+_KNOWN_SILENT_ENGINE_DEFAULT_TIMEOUT: str = "15m"
+
+# Stall ceiling for a registry-detected silent engine whose budget hook is
+# unreachable (e.g. a regressed wrapper dropped expected_silence_budget_s):
+# antigravity's default print-timeout + margin (960 s).
+_SILENT_ENGINE_FALLBACK_THRESHOLD_S: float = (
+    parse_go_duration_seconds(_KNOWN_SILENT_ENGINE_DEFAULT_TIMEOUT) or 900.0
+) + _SILENT_ENGINE_STALL_MARGIN_S
+
+
+def _is_known_silent_engine(engine: object) -> bool:
+    return bool(engine) and str(engine) in _KNOWN_SILENT_ENGINES
+
 
 @dataclass(frozen=True, slots=True)
 class ProgressMessageState:
@@ -2823,6 +2854,12 @@ async def run_runner_with_cancel(
 ) -> RunOutcome:
     outcome = RunOutcome()
     start_time = time.monotonic()
+    # Runner instances are reused across runs and never reset ``last_pid`` /
+    # ``current_stream``, so snapshot them before this run's subprocess can
+    # spawn: the early-PID poller must only accept values produced by *this*
+    # run, not leftovers from the previous one.
+    baseline_pid = getattr(runner, "last_pid", None)
+    baseline_stream = getattr(runner, "current_stream", None)
     try:
         async with anyio.create_task_group() as tg:
 
@@ -2873,12 +2910,12 @@ async def run_runner_with_cancel(
                 """Poll for early PID from subprocess spawn before StartedEvent."""
                 for _ in range(50):  # poll up to 5s
                     pid = getattr(runner, "last_pid", None)
-                    if isinstance(pid, int):
+                    if isinstance(pid, int) and pid != baseline_pid:
                         edits.pid = pid
                         if running_task is not None:
                             running_task.pid = pid
                         cs = getattr(runner, "current_stream", None)
-                        if cs is not None:
+                        if cs is not None and cs is not baseline_stream:
                             edits.stream = cs
                         return
                     await anyio.sleep(0.1)
@@ -3079,13 +3116,37 @@ async def handle_message(
         min_render_interval=progress_cfg.min_render_interval,
     )
 
-    edits._silent_engine = not getattr(runner, "streams_progress", True)
+    # Primary signal: the runner's declared capability. Secondary: the
+    # engine-id registry, so a wrapper that stops forwarding
+    # ``streams_progress`` can't silently reclassify a known envelope-only
+    # engine as a streaming one (and auto-cancel it at ~11 min).
+    declared_silent = not getattr(runner, "streams_progress", True)
+    registry_silent = _is_known_silent_engine(runner.engine)
+    edits._silent_engine = declared_silent or registry_silent
     budget_fn = getattr(runner, "expected_silence_budget_s", None)
     silence_budget_s = budget_fn() if callable(budget_fn) else None
     edits._silence_budget_s = silence_budget_s
     if silence_budget_s:
         edits._STALL_THRESHOLD_SILENT_ENGINE = (
             silence_budget_s + _SILENT_ENGINE_STALL_MARGIN_S
+        )
+    elif registry_silent and not callable(budget_fn):
+        # No budget hook reachable at all (e.g. a regressed wrapper dropped
+        # expected_silence_budget_s). Derive the ceiling from antigravity's
+        # own default print-timeout + margin rather than the generic 900 s
+        # class default, so the first stall warning doesn't land just
+        # before agy's own default timeout would have resolved the run.
+        # A correctly-forwarded runner whose budget hook returns None (e.g.
+        # print_timeout unset/unparseable) still falls through to the
+        # pre-existing 900 s class default below — unchanged behaviour for
+        # that case.
+        edits._STALL_THRESHOLD_SILENT_ENGINE = _SILENT_ENGINE_FALLBACK_THRESHOLD_S
+    if registry_silent and not declared_silent:
+        logger.warning(
+            "runner_bridge.silent_engine_capability_mismatch",
+            engine=str(runner.engine),
+            runner_type=type(runner).__name__,
+            budget_hook=callable(budget_fn),
         )
 
     # Apply watchdog settings to runner and edits

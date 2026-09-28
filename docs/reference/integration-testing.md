@@ -11,6 +11,13 @@ Structured, repeatable integration test process run against `@untether_dev_bot` 
 | **Test chats** | 6 dedicated Telegram groups in the `ut-dev` folder, one per engine |
 | **Engines** | Claude, Codex, OpenCode, Pi, Gemini, Amp |
 
+> **Coverage gap:** Antigravity (`agy`) has no dedicated chat in this 6-engine matrix and is
+> not covered by any automated tier below, despite this doc's intro claiming "all 6 engines."
+> It's a 7th supported engine (see `runners/antigravity.py`) added after this matrix was set
+> up. Until a dedicated `ut-dev` chat + test tier exist for it, any release touching the
+> Antigravity runner needs an ad-hoc manual check via `@untether_dev_bot` before fleet rollout
+> — not formalized as a numbered tier here yet.
+
 ## Automated Testing via Telegram MCP
 
 All integration test tiers are fully automated by Claude Code using Telegram MCP tools and the Bash tool. The relevant MCP tools are:

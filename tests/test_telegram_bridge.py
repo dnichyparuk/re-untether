@@ -1734,6 +1734,90 @@ async def test_run_engine_hides_resume_line_in_topics() -> None:
     assert "resume-123" not in transport.last_message.text
 
 
+class _SilentScriptRunner(ScriptRunner):
+    """Envelope-only engine stub (Antigravity-shaped capability surface)."""
+
+    streams_progress = False
+    last_pid: int | None = None
+    SILENCE_BUDGET_S = 1800.0
+
+    def expected_silence_budget_s(self) -> float | None:
+        return self.SILENCE_BUDGET_S
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("show_resume_line", "reasoning"),
+    [
+        (True, None),  # unwrapped control
+        (False, None),  # _ResumeLineProxy only
+        (True, "high"),  # _PreludeRunner only (unsupported reasoning override)
+        (False, "high"),  # _PreludeRunner(_ResumeLineProxy(runner))
+    ],
+    ids=["unwrapped", "resume_proxy", "prelude", "nested"],
+)
+async def test_run_engine_wrapped_silent_engine_classified_silent(
+    monkeypatch: pytest.MonkeyPatch,
+    show_resume_line: bool,
+    reasoning: str | None,
+) -> None:
+    import untether.runner_bridge as runner_bridge
+    from untether.runners.run_options import EngineRunOptions
+
+    created: list[runner_bridge.ProgressEdits] = []
+
+    class _RecordingProgressEdits(runner_bridge.ProgressEdits):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(runner_bridge, "ProgressEdits", _RecordingProgressEdits)
+
+    transport = _CaptureTransport()
+    runner = _SilentScriptRunner(
+        [Return(answer="ok")],
+        engine="antigravity",
+        resume_value="conv-123",
+    )
+    exec_cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    runtime = TransportRuntime(
+        router=_make_router(runner),
+        projects=_empty_projects(),
+    )
+
+    await _run_engine(
+        exec_cfg=exec_cfg,
+        runtime=runtime,
+        running_tasks={},
+        chat_id=123,
+        user_msg_id=1,
+        text="hello",
+        resume_token=None,
+        context=None,
+        reply_ref=None,
+        on_thread_known=None,
+        engine_override=None,
+        thread_id=77,
+        show_resume_line=show_resume_line,
+        run_options=(
+            EngineRunOptions(reasoning=reasoning) if reasoning is not None else None
+        ),
+    )
+
+    assert len(created) == 1
+    edits = created[0]
+    assert edits._silent_engine is True
+    assert edits._silence_budget_s == _SilentScriptRunner.SILENCE_BUDGET_S
+    assert edits._STALL_THRESHOLD_SILENT_ENGINE == (
+        _SilentScriptRunner.SILENCE_BUDGET_S
+        + runner_bridge._SILENT_ENGINE_STALL_MARGIN_S
+    )
+
+
 @pytest.mark.anyio
 async def test_run_main_loop_routes_reply_to_running_resume() -> None:
     progress_ready = anyio.Event()

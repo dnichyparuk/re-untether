@@ -30,6 +30,9 @@ engines like Gemini (`stream-json`).
 
 | Condition | Runner behaviour |
 |-----------|------------------|
-| Non-zero exit code | `process_error_events` → note + `CompletedEvent(ok=False)` with rc label + stderr excerpt |
+| Non-zero exit code, **no** envelope decoded | `process_error_events` → note + `CompletedEvent(ok=False)` with rc label + stderr excerpt |
+| Non-zero exit code, envelope **was** decoded (`did_emit_completed`) | `process_error_events` is skipped — the `CompletedEvent` already emitted from `translate()` (with the envelope's real `error` text) stands. Confirmed live (agy 1.2.12) for interrupted runs (rc=1, `error: "interrupted"`) and invalid `--model` (rc=1, `error` lists available models) — both cases still emit a usable envelope, so this path handles them correctly today |
 | No envelope on stdout | `stream_end_events` → `CompletedEvent(ok=False, error="agy produced no result envelope")` |
 | Undecodable JSON line | `decode_error_events` drops the line (logs `jsonl.msgspec.invalid`) |
+| `--print-timeout` expiry | **Not** a terminal-fallback case — agy exits 0 with `status: "SUCCESS"`, so it's handled by the normal `translate()` success path with `ok=True`, even though the run was cut short. See `runner.md` → "Known limitations". |
+| rc=3 (`AGY_ERROR`, model/agent API failure) | Documented upstream since agy 1.2.6 but not reproduced live; unconfirmed whether an envelope is always decoded in this case. If not, falls into the first row above with no rc=3-specific handling. |

@@ -575,7 +575,6 @@ async def test_running_task_pid_set_from_thread_pid_poller() -> None:
         engine=CODEX_ENGINE,
         resume_value=session_id,
     )
-    runner.last_pid = 9999
     cfg = ExecBridgeConfig(
         transport=transport,
         presenter=MarkdownPresenter(),
@@ -602,6 +601,9 @@ async def test_running_task_pid_set_from_thread_pid_poller() -> None:
             await anyio.lowlevel.checkpoint()
         assert running_tasks
         running_task = running_tasks[next(iter(running_tasks))]
+        # Simulate the subprocess spawning mid-run (a pid present before the
+        # run starts is a stale leftover and is deliberately ignored).
+        runner.last_pid = 9999
         with anyio.fail_after(2):
             while running_task.pid != 9999:
                 await anyio.sleep(0.05)
@@ -4366,6 +4368,461 @@ async def test_stall_threshold_elevated_for_antigravity() -> None:
         f"{[c['message'].text for c in stall_msgs]}"
     )
     assert edits._stall_warn_count == 0
+
+
+class _SilentScriptRunner(ScriptRunner):
+    """Envelope-only engine stub (Antigravity-shaped capability surface)."""
+
+    streams_progress = False
+    last_pid: int | None = None
+    SILENCE_BUDGET_S = 1800.0
+
+    def expected_silence_budget_s(self) -> float | None:
+        return self.SILENCE_BUDGET_S
+
+
+@pytest.mark.anyio
+async def test_handle_message_wrapped_silent_engine_not_auto_cancelled_no_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent engine behind the executor's wrapper survives past ~11 min.
+
+    Regression for the Telegram-submitted Antigravity auto-cancel: through
+    ``_ResumeLineProxy`` the bridge used to lose ``streams_progress`` /
+    ``expected_silence_budget_s``, fall back to the 300 s "normal" threshold
+    and fire ``no_pid_no_events`` after three warnings (300/480/660 s).
+    Real thresholds and repeat cadence are kept; only the monitor tick is
+    shrunk and the fake clock driven forward.
+    """
+    import untether.runner_bridge as runner_bridge
+    from untether.settings import WatchdogSettings
+    from untether.telegram.commands.executor import _ResumeLineProxy
+
+    created: list[ProgressEdits] = []
+
+    class _FastTickProgressEdits(ProgressEdits):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self._stall_check_interval = 0.01
+            created.append(self)
+
+    monkeypatch.setattr(runner_bridge, "ProgressEdits", _FastTickProgressEdits)
+    monkeypatch.setattr(
+        runner_bridge, "_load_watchdog_settings", lambda: WatchdogSettings()
+    )
+
+    transport = FakeTransport()
+    hold = anyio.Event()
+    inner = _SilentScriptRunner(
+        [Wait(hold), Return(answer="done")],
+        engine="antigravity",
+        resume_value="conv-123",
+        emit_session_start=False,
+    )
+    runner = _ResumeLineProxy(inner)
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    clock = _FakeClock(start=100.0)
+    running_tasks: dict = {}
+    finished = anyio.Event()
+
+    def _auto_cancel_sends() -> list[dict]:
+        return [
+            c for c in transport.send_calls if "Auto-cancelled" in c["message"].text
+        ]
+
+    async def run_handle_message() -> None:
+        try:
+            await handle_message(
+                cfg,
+                runner=runner,  # type: ignore[arg-type]
+                incoming=IncomingMessage(
+                    channel_id=123, message_id=10, text="long silent task"
+                ),
+                resume_token=None,
+                running_tasks=running_tasks,
+                clock=clock,
+            )
+        finally:
+            finished.set()
+
+    with anyio.fail_after(20):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_handle_message)
+            for _ in range(200):
+                if created:
+                    break
+                await anyio.lowlevel.checkpoint()
+            assert created
+
+            # Drive the fake clock from 0 to 20 min of silence in 30 s steps,
+            # well past the 660 s point where the pre-fix bug auto-cancelled.
+            for step in range(1, 41):
+                clock.set(100.0 + step * 30.0)
+                await anyio.sleep(0.03)
+                if finished.is_set() or _auto_cancel_sends():
+                    break
+            hold.set()
+
+    assert _auto_cancel_sends() == [], [c["message"].text for c in _auto_cancel_sends()]
+    edits = created[0]
+    assert edits._silent_engine is True
+    assert edits._STALL_THRESHOLD_SILENT_ENGINE == (
+        _SilentScriptRunner.SILENCE_BUDGET_S
+        + runner_bridge._SILENT_ENGINE_STALL_MARGIN_S
+    )
+    assert edits._stall_warn_count == 0
+    assert "done" in transport.send_calls[-1]["message"].text
+
+
+# ---------------------------------------------------------------------------
+# Known-silent-engine registry (defense in depth behind capability forwarding)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_no_pid_arm_skipped_for_known_silent_engine_even_if_misclassified() -> (
+    None
+):
+    """``no_pid_no_events`` must not fire for a registry-known silent engine.
+
+    Simulates a regressed wrapper that dropped ``streams_progress``: the run
+    is misclassified (``_silent_engine = False``) but the tracker's engine id
+    is ``antigravity``, so the registry backstop keeps the arm from firing.
+    Mirrors ``test_stall_auto_cancel_no_pid_no_events`` otherwise.
+    """
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits.tracker.engine = "antigravity"
+    edits._silent_engine = False  # regressed wrapper: capability lost
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._stall_repeat_seconds = 0.01
+    edits._STALL_MAX_WARNINGS_NO_PID = 2
+    edits.pid = None
+    edits.event_seq = 0
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            for i in range(5):
+                clock.set(100.1 + i * 0.1)
+                await anyio.sleep(0.03)
+                if cancel_event.is_set():
+                    break
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert edits._is_silent_engine_run() is True
+    # The monitor did reach the point where the arm would have fired.
+    assert edits._stall_warn_count >= edits._STALL_MAX_WARNINGS_NO_PID
+    assert not cancel_event.is_set()
+    assert [
+        c for c in transport.send_calls if "Auto-cancelled" in c["message"].text
+    ] == []
+
+
+def test_is_known_silent_engine_helper() -> None:
+    import untether.runner_bridge as runner_bridge
+
+    assert runner_bridge._is_known_silent_engine("antigravity") is True
+    assert runner_bridge._is_known_silent_engine("codex") is False
+    assert runner_bridge._is_known_silent_engine(None) is False
+    assert runner_bridge._is_known_silent_engine("") is False
+
+
+def test_silent_engine_fallback_threshold_value() -> None:
+    import untether.runner_bridge as runner_bridge
+
+    # 15m antigravity default print-timeout + 60 s margin.
+    assert runner_bridge._SILENT_ENGINE_FALLBACK_THRESHOLD_S == 960.0
+    assert runner_bridge._SILENT_ENGINE_FALLBACK_THRESHOLD_S == (
+        900.0 + runner_bridge._SILENT_ENGINE_STALL_MARGIN_S
+    )
+
+
+def test_silent_engine_fallback_timeout_matches_antigravity_default() -> None:
+    """The duplicated literal must track antigravity's own default."""
+    import untether.runner_bridge as runner_bridge
+    from untether.runners import antigravity
+
+    assert (
+        runner_bridge._KNOWN_SILENT_ENGINE_DEFAULT_TIMEOUT
+        == antigravity._DEFAULT_PRINT_TIMEOUT
+    )
+
+
+@pytest.mark.anyio
+async def test_handle_message_registry_marks_silent_when_wrapper_drops_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrapper that forwards nothing still yields a silent-engine run.
+
+    Simulates a hypothetical future proxy that exposes only the core Runner
+    protocol (engine/run/is_resume_line/format_resume) and drops every
+    capability attribute. The registry must mark the run silent, use the
+    antigravity-derived fallback threshold, and emit the mismatch WARNING.
+    """
+    from structlog.testing import capture_logs
+
+    import untether.runner_bridge as runner_bridge
+
+    created: list[ProgressEdits] = []
+
+    class _CapturingProgressEdits(ProgressEdits):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(runner_bridge, "ProgressEdits", _CapturingProgressEdits)
+
+    inner = _SilentScriptRunner(
+        [Return(answer="done")],
+        engine="antigravity",
+        resume_value="conv-123",
+        emit_session_start=False,
+    )
+
+    class _DumbWrapper:
+        """No capability forwarding at all (regressed-wrapper simulation)."""
+
+        def __init__(self, wrapped: ScriptRunner) -> None:
+            self.engine = wrapped.engine
+            self.run = wrapped.run
+            self.is_resume_line = wrapped.is_resume_line
+            self.format_resume = wrapped.format_resume
+
+    runner = _DumbWrapper(inner)
+    assert not hasattr(runner, "streams_progress")
+    assert not hasattr(runner, "expected_silence_budget_s")
+
+    transport = FakeTransport()
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+
+    with capture_logs() as logs:
+        with anyio.fail_after(10):
+            await handle_message(
+                cfg,
+                runner=runner,  # type: ignore[arg-type]
+                incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+                resume_token=None,
+            )
+
+    assert created
+    edits = created[0]
+    assert edits._silent_engine is True
+    assert edits._silence_budget_s is None
+    assert (
+        edits._STALL_THRESHOLD_SILENT_ENGINE
+        == runner_bridge._SILENT_ENGINE_FALLBACK_THRESHOLD_S
+    )
+    mismatch = [
+        e
+        for e in logs
+        if e.get("event") == "runner_bridge.silent_engine_capability_mismatch"
+    ]
+    assert len(mismatch) == 1
+    assert mismatch[0]["log_level"] == "warning"
+    assert mismatch[0]["engine"] == "antigravity"
+    assert mismatch[0]["runner_type"] == "_DumbWrapper"
+    assert mismatch[0]["budget_hook"] is False
+    assert "done" in transport.send_calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+async def test_handle_message_no_mismatch_warning_when_capabilities_forwarded() -> None:
+    """Declared + registry agree for a correctly-behaving silent runner."""
+    from structlog.testing import capture_logs
+
+    runner = _SilentScriptRunner(
+        [Return(answer="done")],
+        engine="antigravity",
+        resume_value="conv-123",
+        emit_session_start=False,
+    )
+    cfg = ExecBridgeConfig(
+        transport=FakeTransport(),
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    with capture_logs() as logs:
+        with anyio.fail_after(10):
+            await handle_message(
+                cfg,
+                runner=runner,
+                incoming=IncomingMessage(channel_id=123, message_id=10, text="hi"),
+                resume_token=None,
+            )
+    assert not [
+        e
+        for e in logs
+        if e.get("event") == "runner_bridge.silent_engine_capability_mismatch"
+    ]
+
+
+def _class_default(cls: type, name: str, fallback: object) -> object:
+    """Resolve a runner class's default for ``name``.
+
+    Slots dataclasses replace class attributes with member descriptors, so
+    read the dataclass field default where one exists; otherwise fall back
+    to the plain class attribute (e.g. ``BaseRunner.streams_progress``).
+    """
+    import dataclasses
+
+    if dataclasses.is_dataclass(cls):
+        for f in dataclasses.fields(cls):
+            if f.name == name and f.default is not dataclasses.MISSING:
+                return f.default
+    value = getattr(cls, name, fallback)
+    if type(value).__name__ == "member_descriptor":
+        return fallback
+    return value
+
+
+def test_known_silent_engines_matches_runner_declarations() -> None:
+    """``_KNOWN_SILENT_ENGINES`` must equal the set of runners declaring
+    ``streams_progress = False`` across every registered engine backend."""
+    import importlib
+    import inspect
+    from importlib.metadata import entry_points
+
+    import untether.runner_bridge as runner_bridge
+    from untether.runner import BaseRunner
+
+    eps = list(entry_points(group="untether.engine_backends"))
+    assert len(eps) >= 7, [ep.name for ep in eps]
+
+    silent: set[str] = set()
+    seen: set[str] = set()
+    for ep in eps:
+        backend = ep.load()
+        module = importlib.import_module(ep.module)
+        runner_classes = [
+            obj
+            for _, obj in inspect.getmembers(module, inspect.isclass)
+            if issubclass(obj, BaseRunner)
+            and obj.__module__ == module.__name__
+            and _class_default(obj, "engine", None) == backend.id
+        ]
+        assert len(runner_classes) == 1, (ep.name, runner_classes)
+        cls = runner_classes[0]
+        seen.add(backend.id)
+        streams = _class_default(cls, "streams_progress", True)
+        assert isinstance(streams, bool), (backend.id, streams)
+        if streams is False:
+            silent.add(backend.id)
+
+    assert {"claude", "codex", "antigravity"} <= seen
+    assert silent == set(runner_bridge._KNOWN_SILENT_ENGINES)
+
+
+@pytest.mark.anyio
+async def test_thread_pid_poller_ignores_stale_pid_from_previous_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Early-PID poller must not adopt the previous run's pid/stream.
+
+    ``Runner.last_pid`` / ``current_stream`` are never reset between runs on a
+    reused runner instance. For a silent engine (no early ``StartedEvent`` to
+    correct it), the poller used to pick up run 1's pid/stream for the whole
+    of run 2. It must instead wait for a genuinely new value.
+    """
+    import untether.runner_bridge as runner_bridge
+    from untether.runner import JsonlStreamState
+
+    created: list[ProgressEdits] = []
+
+    class _CapturingProgressEdits(ProgressEdits):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(runner_bridge, "ProgressEdits", _CapturingProgressEdits)
+
+    transport = FakeTransport()
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    runner = _SilentScriptRunner(
+        [],
+        engine="antigravity",
+        resume_value="conv-123",
+        emit_session_start=False,
+    )
+    stream_a = JsonlStreamState(expected_session=None)
+    stream_b = JsonlStreamState(expected_session=None)
+
+    async def one_run(message_id: int, drive) -> None:
+        hold = anyio.Event()
+        runner._script = [Wait(hold), Return(answer="done")]
+        running_tasks: dict = {}
+        n_before = len(created)
+
+        async def run_handle_message() -> None:
+            await handle_message(
+                cfg,
+                runner=runner,
+                incoming=IncomingMessage(
+                    channel_id=123, message_id=message_id, text="task"
+                ),
+                resume_token=None,
+                running_tasks=running_tasks,
+            )
+
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(run_handle_message)
+                for _ in range(200):
+                    if running_tasks and len(created) > n_before:
+                        break
+                    await anyio.lowlevel.checkpoint()
+                assert running_tasks
+                running_task = running_tasks[next(iter(running_tasks))]
+                await drive(running_task, created[-1])
+                hold.set()
+
+    async def drive_run1(running_task, edits) -> None:
+        # Subprocess spawns partway through run 1.
+        runner.last_pid = 111
+        runner.current_stream = stream_a
+        while running_task.pid != 111:
+            await anyio.sleep(0.02)
+        assert edits.pid == 111
+        assert edits.stream is stream_a
+
+    async def drive_run2(running_task, edits) -> None:
+        # New subprocess not spawned yet: let the poller tick several times
+        # against the stale run-1 values still sitting on the runner.
+        await anyio.sleep(0.35)
+        assert running_task.pid is None
+        assert edits.pid is None
+        assert edits.stream is None
+        # Now the new subprocess spawns.
+        runner.last_pid = 222
+        runner.current_stream = stream_b
+        while running_task.pid != 222:
+            await anyio.sleep(0.02)
+        assert edits.pid == 222
+        assert edits.stream is stream_b
+
+    await one_run(10, drive_run1)
+    await one_run(20, drive_run2)
+    assert len(created) == 2
 
 
 @pytest.mark.anyio
