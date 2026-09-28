@@ -40,8 +40,36 @@ from ..engine_overrides import supports_reasoning
 logger = get_logger(__name__)
 
 
+class _RunnerForwardingMixin:
+    """Transparent delegation to ``self.runner``.
+
+    A wrapper may only override behaviour *explicitly* (property/method
+    defined on the wrapper). Anything not defined is read from and written
+    to the wrapped runner, so new runner capabilities (streams_progress,
+    expected_silence_budget_s, last_pid, watchdog knobs, ...) reach the
+    bridge without ever touching this file again.
+    """
+
+    __slots__ = ()
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "runner" or (name.startswith("__") and name.endswith("__")):
+            raise AttributeError(name)
+        try:
+            inner = object.__getattribute__(self, "runner")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(inner, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if hasattr(type(self), name):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "runner"), name, value)
+
+
 @dataclass(slots=True)
-class _ResumeLineProxy:
+class _ResumeLineProxy(_RunnerForwardingMixin):
     runner: Runner
 
     @property
@@ -68,7 +96,7 @@ class _ResumeLineProxy:
 
 
 @dataclass(slots=True)
-class _PreludeRunner:
+class _PreludeRunner(_RunnerForwardingMixin):
     runner: Runner
     prelude_events: Sequence[UntetherEvent]
 

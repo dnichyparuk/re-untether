@@ -4368,6 +4368,114 @@ async def test_stall_threshold_elevated_for_antigravity() -> None:
     assert edits._stall_warn_count == 0
 
 
+class _SilentScriptRunner(ScriptRunner):
+    """Envelope-only engine stub (Antigravity-shaped capability surface)."""
+
+    streams_progress = False
+    last_pid: int | None = None
+    SILENCE_BUDGET_S = 1800.0
+
+    def expected_silence_budget_s(self) -> float | None:
+        return self.SILENCE_BUDGET_S
+
+
+@pytest.mark.anyio
+async def test_handle_message_wrapped_silent_engine_not_auto_cancelled_no_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent engine behind the executor's wrapper survives past ~11 min.
+
+    Regression for the Telegram-submitted Antigravity auto-cancel: through
+    ``_ResumeLineProxy`` the bridge used to lose ``streams_progress`` /
+    ``expected_silence_budget_s``, fall back to the 300 s "normal" threshold
+    and fire ``no_pid_no_events`` after three warnings (300/480/660 s).
+    Real thresholds and repeat cadence are kept; only the monitor tick is
+    shrunk and the fake clock driven forward.
+    """
+    import untether.runner_bridge as runner_bridge
+    from untether.settings import WatchdogSettings
+    from untether.telegram.commands.executor import _ResumeLineProxy
+
+    created: list[ProgressEdits] = []
+
+    class _FastTickProgressEdits(ProgressEdits):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self._stall_check_interval = 0.01
+            created.append(self)
+
+    monkeypatch.setattr(runner_bridge, "ProgressEdits", _FastTickProgressEdits)
+    monkeypatch.setattr(
+        runner_bridge, "_load_watchdog_settings", lambda: WatchdogSettings()
+    )
+
+    transport = FakeTransport()
+    hold = anyio.Event()
+    inner = _SilentScriptRunner(
+        [Wait(hold), Return(answer="done")],
+        engine="antigravity",
+        resume_value="conv-123",
+        emit_session_start=False,
+    )
+    runner = _ResumeLineProxy(inner)
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    clock = _FakeClock(start=100.0)
+    running_tasks: dict = {}
+    finished = anyio.Event()
+
+    def _auto_cancel_sends() -> list[dict]:
+        return [
+            c for c in transport.send_calls if "Auto-cancelled" in c["message"].text
+        ]
+
+    async def run_handle_message() -> None:
+        try:
+            await handle_message(
+                cfg,
+                runner=runner,  # type: ignore[arg-type]
+                incoming=IncomingMessage(
+                    channel_id=123, message_id=10, text="long silent task"
+                ),
+                resume_token=None,
+                running_tasks=running_tasks,
+                clock=clock,
+            )
+        finally:
+            finished.set()
+
+    with anyio.fail_after(20):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_handle_message)
+            for _ in range(200):
+                if created:
+                    break
+                await anyio.lowlevel.checkpoint()
+            assert created
+
+            # Drive the fake clock from 0 to 20 min of silence in 30 s steps,
+            # well past the 660 s point where the pre-fix bug auto-cancelled.
+            for step in range(1, 41):
+                clock.set(100.0 + step * 30.0)
+                await anyio.sleep(0.03)
+                if finished.is_set() or _auto_cancel_sends():
+                    break
+            hold.set()
+
+    assert _auto_cancel_sends() == [], [c["message"].text for c in _auto_cancel_sends()]
+    edits = created[0]
+    assert edits._silent_engine is True
+    assert edits._STALL_THRESHOLD_SILENT_ENGINE == (
+        _SilentScriptRunner.SILENCE_BUDGET_S
+        + runner_bridge._SILENT_ENGINE_STALL_MARGIN_S
+    )
+    assert edits._stall_warn_count == 0
+    assert "done" in transport.send_calls[-1]["message"].text
+
+
 @pytest.mark.anyio
 async def test_stall_threshold_elevated_with_high_tcp() -> None:
     """When TCP count exceeds threshold, use subagent threshold even without child_pids."""
