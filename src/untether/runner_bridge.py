@@ -2823,6 +2823,12 @@ async def run_runner_with_cancel(
 ) -> RunOutcome:
     outcome = RunOutcome()
     start_time = time.monotonic()
+    # Runner instances are reused across runs and never reset ``last_pid`` /
+    # ``current_stream``, so snapshot them before this run's subprocess can
+    # spawn: the early-PID poller must only accept values produced by *this*
+    # run, not leftovers from the previous one.
+    baseline_pid = getattr(runner, "last_pid", None)
+    baseline_stream = getattr(runner, "current_stream", None)
     try:
         async with anyio.create_task_group() as tg:
 
@@ -2873,12 +2879,12 @@ async def run_runner_with_cancel(
                 """Poll for early PID from subprocess spawn before StartedEvent."""
                 for _ in range(50):  # poll up to 5s
                     pid = getattr(runner, "last_pid", None)
-                    if isinstance(pid, int):
+                    if isinstance(pid, int) and pid != baseline_pid:
                         edits.pid = pid
                         if running_task is not None:
                             running_task.pid = pid
                         cs = getattr(runner, "current_stream", None)
-                        if cs is not None:
+                        if cs is not None and cs is not baseline_stream:
                             edits.stream = cs
                         return
                     await anyio.sleep(0.1)

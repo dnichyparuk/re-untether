@@ -575,7 +575,6 @@ async def test_running_task_pid_set_from_thread_pid_poller() -> None:
         engine=CODEX_ENGINE,
         resume_value=session_id,
     )
-    runner.last_pid = 9999
     cfg = ExecBridgeConfig(
         transport=transport,
         presenter=MarkdownPresenter(),
@@ -602,6 +601,9 @@ async def test_running_task_pid_set_from_thread_pid_poller() -> None:
             await anyio.lowlevel.checkpoint()
         assert running_tasks
         running_task = running_tasks[next(iter(running_tasks))]
+        # Simulate the subprocess spawning mid-run (a pid present before the
+        # run starts is a stale leftover and is deliberately ignored).
+        runner.last_pid = 9999
         with anyio.fail_after(2):
             while running_task.pid != 9999:
                 await anyio.sleep(0.05)
@@ -4474,6 +4476,102 @@ async def test_handle_message_wrapped_silent_engine_not_auto_cancelled_no_pid(
     )
     assert edits._stall_warn_count == 0
     assert "done" in transport.send_calls[-1]["message"].text
+
+
+@pytest.mark.anyio
+async def test_thread_pid_poller_ignores_stale_pid_from_previous_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Early-PID poller must not adopt the previous run's pid/stream.
+
+    ``Runner.last_pid`` / ``current_stream`` are never reset between runs on a
+    reused runner instance. For a silent engine (no early ``StartedEvent`` to
+    correct it), the poller used to pick up run 1's pid/stream for the whole
+    of run 2. It must instead wait for a genuinely new value.
+    """
+    import untether.runner_bridge as runner_bridge
+    from untether.runner import JsonlStreamState
+
+    created: list[ProgressEdits] = []
+
+    class _CapturingProgressEdits(ProgressEdits):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(runner_bridge, "ProgressEdits", _CapturingProgressEdits)
+
+    transport = FakeTransport()
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=True,
+    )
+    runner = _SilentScriptRunner(
+        [],
+        engine="antigravity",
+        resume_value="conv-123",
+        emit_session_start=False,
+    )
+    stream_a = JsonlStreamState(expected_session=None)
+    stream_b = JsonlStreamState(expected_session=None)
+
+    async def one_run(message_id: int, drive) -> None:
+        hold = anyio.Event()
+        runner._script = [Wait(hold), Return(answer="done")]
+        running_tasks: dict = {}
+        n_before = len(created)
+
+        async def run_handle_message() -> None:
+            await handle_message(
+                cfg,
+                runner=runner,
+                incoming=IncomingMessage(
+                    channel_id=123, message_id=message_id, text="task"
+                ),
+                resume_token=None,
+                running_tasks=running_tasks,
+            )
+
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(run_handle_message)
+                for _ in range(200):
+                    if running_tasks and len(created) > n_before:
+                        break
+                    await anyio.lowlevel.checkpoint()
+                assert running_tasks
+                running_task = running_tasks[next(iter(running_tasks))]
+                await drive(running_task, created[-1])
+                hold.set()
+
+    async def drive_run1(running_task, edits) -> None:
+        # Subprocess spawns partway through run 1.
+        runner.last_pid = 111
+        runner.current_stream = stream_a
+        while running_task.pid != 111:
+            await anyio.sleep(0.02)
+        assert edits.pid == 111
+        assert edits.stream is stream_a
+
+    async def drive_run2(running_task, edits) -> None:
+        # New subprocess not spawned yet: let the poller tick several times
+        # against the stale run-1 values still sitting on the runner.
+        await anyio.sleep(0.35)
+        assert running_task.pid is None
+        assert edits.pid is None
+        assert edits.stream is None
+        # Now the new subprocess spawns.
+        runner.last_pid = 222
+        runner.current_stream = stream_b
+        while running_task.pid != 222:
+            await anyio.sleep(0.02)
+        assert edits.pid == 222
+        assert edits.stream is stream_b
+
+    await one_run(10, drive_run1)
+    await one_run(20, drive_run2)
+    assert len(created) == 2
 
 
 @pytest.mark.anyio
