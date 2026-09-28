@@ -8,7 +8,9 @@ completion — not a streaming event feed. Consequently this runner produces a r
 resume token (from `conversation_id`), the answer, and token usage, but **no live
 ActionEvent progress** and **no interactive approval** (agy has no control channel).
 
-Verified against agy 1.0.16. See docs/reference/runners/antigravity/ for the protocol.
+Originally verified against agy 1.0.16; re-verified live against agy 1.2.12 (2026-09).
+See docs/reference/runners/antigravity/ for the protocol, including deltas found on
+re-verification (print-timeout default, exit codes, envelope fields).
 """
 
 from __future__ import annotations
@@ -47,9 +49,14 @@ logger = get_logger(__name__)
 
 ENGINE: EngineId = "antigravity"
 
-# agy's own `--print-timeout` defaults to 5m0s, which silently kills long headless
-# runs. Untether raises it to a more generous default (overridable via
-# [antigravity] print_timeout) so long tasks aren't cut off mid-run. Go duration syntax.
+# Through agy 1.2.5, agy's own `--print-timeout` defaulted to 5m0s, which silently
+# killed long headless runs. As of agy 1.2.6, agy's own default changed to *unlimited*
+# (confirmed live on 1.2.12: `--help` says "0 waits until the turn completes (default
+# 0s)"), so omitting this flag today no longer means "5 minutes" -- it means no
+# timeout at all, which was observed to let a single run balloon to 6+ minutes /
+# 600k+ tokens during re-verification. Untether still pins a bounded default
+# (overridable via [antigravity] print_timeout) so long tasks are bounded regardless
+# of what agy itself defaults to. Go duration syntax.
 _DEFAULT_PRINT_TIMEOUT = "15m"
 
 # Slack (seconds) when comparing an envelope's duration_seconds to the resolved
@@ -120,6 +127,8 @@ def _build_usage(evt: antigravity_schema.AntigravityResult) -> dict[str, Any] | 
         }
         if usage.thinking_tokens is not None:
             token_usage["thinking_tokens"] = usage.thinking_tokens
+        if usage.cache_read_tokens is not None:
+            token_usage["cache_read_tokens"] = usage.cache_read_tokens
         out["usage"] = token_usage
     if isinstance(evt.duration_seconds, (int, float)):
         out["duration_ms"] = int(evt.duration_seconds * 1000)
@@ -468,8 +477,9 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         found_session: ResumeToken | None,
         state: AntigravityStreamState,
     ) -> list[UntetherEvent]:
-        # No envelope arrived (empty stdout). agy 1.0.16 on Linux produces output
-        # on a pipe, but defend the "succeeded but did nothing" non-TTY trap.
+        # No envelope arrived (empty stdout). agy produces output on a pipe fine
+        # (confirmed 1.0.16 through 1.2.12, Linux/WSL), but defend the "succeeded
+        # but did nothing" non-TTY trap.
         parts = ["agy produced no result envelope"]
         session = _session_label(found_session, resume)
         if session:

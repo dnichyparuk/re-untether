@@ -71,6 +71,43 @@ def test_translate_success_fixture() -> None:
     assert completed.error is None
 
 
+def test_translate_maps_cache_read_tokens_when_present() -> None:
+    # cache_read_tokens is mapped through the same way thinking_tokens is: only
+    # present in the output dict when the envelope actually sets it (#14).
+    evt = _decode(
+        {
+            "conversation_id": "test-conv-cache",
+            "status": "SUCCESS",
+            "response": "hi",
+            "duration_seconds": 0.3,
+            "num_turns": 1,
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 1,
+                "thinking_tokens": 0,
+                "cache_read_tokens": 42,
+                "total_tokens": 6,
+            },
+        }
+    )
+    state = AntigravityStreamState()
+    events = translate_antigravity_result(
+        evt, title="antigravity", state=state, meta=None
+    )
+    completed = events[-1]
+    assert isinstance(completed, CompletedEvent)
+    assert completed.usage == {
+        "usage": {
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "thinking_tokens": 0,
+            "cache_read_tokens": 42,
+        },
+        "duration_ms": 300,
+        "num_turns": 1,
+    }
+
+
 def test_translate_failure_fixture() -> None:
     runner = AntigravityRunner()
     evt = _load_fixture("antigravity_failure.jsonl")
@@ -82,6 +119,45 @@ def test_translate_failure_fixture() -> None:
     assert completed.ok is False
     assert completed.error is not None
     assert "quota exhausted" in completed.error
+
+
+def test_translate_success_v1_2_12_fixture() -> None:
+    # Regression fixture for the real 1.2.12 envelope shape (re-verification, #14):
+    # includes usage.cache_read_tokens alongside usage.total_tokens.
+    runner = AntigravityRunner()
+    evt = _load_fixture("antigravity_success_v1_2_12.jsonl")
+    events = runner.translate(
+        evt, state=AntigravityStreamState(), resume=None, found_session=None
+    )
+    completed = events[-1]
+    assert isinstance(completed, CompletedEvent)
+    assert completed.ok is True
+    assert completed.usage == {
+        "usage": {
+            "input_tokens": 18432,
+            "output_tokens": 145,
+            "thinking_tokens": 32,
+            "cache_read_tokens": 1200,
+        },
+        "duration_ms": 2800,
+        "num_turns": 1,
+    }
+
+
+def test_translate_invalid_model_fixture() -> None:
+    # Regression fixture for agy's hard-fail on an unrecognized --model (confirmed
+    # live on 1.2.12, fixed upstream in agy 1.1.2; #14).
+    runner = AntigravityRunner()
+    evt = _load_fixture("antigravity_invalid_model.jsonl")
+    events = runner.translate(
+        evt, state=AntigravityStreamState(), resume=None, found_session=None
+    )
+    completed = events[-1]
+    assert isinstance(completed, CompletedEvent)
+    assert completed.ok is False
+    assert completed.error is not None
+    assert "not recognized as a known model" in completed.error
+    assert "Available models:" in completed.error
 
 
 def test_translate_started_emitted_once() -> None:
@@ -306,7 +382,8 @@ def test_build_args_fresh() -> None:
     assert args[:4] == ["-p", "do a thing", "--output-format", "json"]
     assert "--dangerously-skip-permissions" in args  # auto_approve default True
     assert "--continue" not in args and "--conversation" not in args
-    # Untether raises agy's 5m print-timeout to a generous default (see root cause).
+    # Untether's own print-timeout default (15m) is unconditional -- it doesn't
+    # depend on what agy itself defaults to.
     assert args[args.index("--print-timeout") + 1] == "15m"
 
 
@@ -497,7 +574,8 @@ def test_build_runner_defaults(tmp_path: Path) -> None:
     assert isinstance(runner, AntigravityRunner)
     assert runner.auto_approve is True
     assert runner.engine == ENGINE
-    # Default overrides agy's own 5m0s print-timeout so long runs aren't cut off.
+    # Untether always pins a bounded default so long runs aren't cut off (agy's
+    # own default is unlimited as of 1.2.6, not the 5m0s of earlier agy versions).
     assert runner.print_timeout == "15m"
 
 

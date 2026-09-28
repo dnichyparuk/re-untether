@@ -205,7 +205,7 @@ Key test files:
 
 - `test_claude_control.py` — 99 tests: control requests, response routing, registry lifecycle, auto-approve/auto-deny, tool auto-approve, custom deny messages, discuss action, early toast, progressive cooldown, auto permission mode, diff_preview plan bypass
 - `test_callback_dispatch.py` — 26 tests: callback parsing, dispatch toast/ephemeral behaviour, early answering
-- `test_exec_bridge.py` — 140 tests: ephemeral notification cleanup, approval push notifications, progressive stall warnings, stall diagnostics, stall auto-cancel with CPU-active suppression (sleeping-process aware), tool-active repeat suppression, approval-aware stall threshold, MCP tool stall threshold, frozen ring buffer hung escalation, session summary, PID/stream threading, auto-continue detection, signal death suppression
+- `test_exec_bridge.py` — 233 tests: ephemeral notification cleanup, approval push notifications, progressive stall warnings, stall diagnostics, stall auto-cancel with CPU-active suppression (sleeping-process aware), tool-active repeat suppression, approval-aware stall threshold, MCP tool stall threshold, frozen ring buffer hung escalation, session summary, PID/stream threading, auto-continue detection, signal death suppression, stale last_pid/current_stream snapshotting on reused runners, known-silent-engine registry classification + threshold scoping
 - `test_ask_user_question.py` — 29 tests: AskUserQuestion control request handling, question extraction, pending request registry, answer routing, option button rendering, multi-question flows, structured answer responses, ask mode toggle auto-deny
 - `test_diff_preview.py` — 14 tests: Edit diff display, Write content preview, Bash command display, line/char truncation
 - `test_cost_tracker.py` — 12 tests: cost accumulation, per-run/daily budget thresholds, warning levels, daily reset, auto-cancel flag
@@ -222,7 +222,7 @@ Key test files:
 - `test_config_command.py` — 221 tests: home page, plan mode/ask mode/verbose/engine/listen/model/reasoning sub-pages, toggle actions, callback vs command routing, button layout, engine-aware visibility, default resolution
 - `test_pi_compaction.py` — 6 tests: compaction start/end, aborted, no tokens, sequence
 - `test_proc_diag.py` — 24 tests: format_diag, is_cpu_active, collect_proc_diag (Linux /proc reads), ProcessDiag defaults
-- `test_exec_runner.py` — 22 tests: event tracking (event_count, recent_events ring buffer, PID in StartedEvent meta), JsonlStreamState defaults
+- `test_exec_runner.py` — 37 tests: event tracking (event_count, recent_events ring buffer, PID in StartedEvent meta), JsonlStreamState defaults
 - `test_build_args.py` — 42 tests: CLI argument construction for all 6 engines, model/reasoning/permission flags
 - `test_telegram_files.py` — 17 tests: file helpers, deduplication, deny globs, default upload paths
 - `test_telegram_file_transfer_helpers.py` — 48 tests: `/file put` and `/file get` command handling, media groups, force overwrite
@@ -245,6 +245,8 @@ Key test files:
 - `test_sdnotify.py` — 7 tests: NOTIFY_SOCKET handling (absent/empty/filesystem/abstract-namespace), send error swallowing, UTF-8 encoding
 - `test_clone_command.py` — 95 tests: `/clone` URL parsing (https/scp, host allowlist, unsafe segments), alias derivation + dedup, destination confinement, `git clone` subprocess outcomes, project registration, dispatcher concurrency guard, hot-reload, command-menu inclusion
 - `test_project_command.py` — 48 tests: `NewProjectSettings` validation/defaults, `sanitize_alias`/`derive_alias` edge cases, `resolve_project_path` traversal/symlink confinement, `handle_project_command` orchestration (disabled, invalid name, alias-collision refusal, non-empty-dest refusal, register-only + topic-bound paths, degrade-to-register-only, write failures), dispatcher concurrency guards, `[new_project]` hot-reload, command-menu inclusion
+- `test_runner_proxy_forwarding.py` — 22 tests: `_RunnerForwardingMixin` `__getattr__`/`__setattr__` delegation on `_ResumeLineProxy`/`_PreludeRunner`, `streams_progress`/`expected_silence_budget_s`/`last_pid` forwarding through wrapper proxies, watchdog-knob `hasattr`+assignment round-trip on slotted dataclasses (#14)
+- `test_antigravity_runner.py` — 44 tests: resume format/extract, envelope-to-event translation (success/failure/started-once/empty-conversation-id fallback), `usage` mapping including `cache_read_tokens`, `build_args` construction (model/sandbox/print-timeout/extra_args), print-timeout-truncation heuristic (empty vs non-empty response, resolved-budget threshold), 1.2.12 envelope + invalid-`--model` error regression fixtures
 
 ## Development
 
