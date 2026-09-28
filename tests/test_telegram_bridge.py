@@ -3551,7 +3551,11 @@ async def test_run_main_loop_batches_media_group_upload(
     async with anyio.create_task_group() as tg:
         tg.start_soon(run_main_loop, cfg, poller)
         try:
-            with anyio.fail_after(3):
+            # run_main_loop's startup (notably the command menu build, which
+            # re-scans importlib.metadata entry points once per command
+            # backend) takes ~2.5-3s on slow filesystems before the media
+            # group is even processed — a 3s budget is too tight and flaky.
+            with anyio.fail_after(10):
                 while len(transport.send_calls) < 1:
                     await anyio.sleep(0.05)
             assert len(transport.send_calls) == 1
