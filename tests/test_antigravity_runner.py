@@ -136,6 +136,168 @@ def test_permission_mode_composition() -> None:
     assert started.meta["permissionMode"] == "full access · sandbox"
 
 
+# --- print-timeout truncation heuristic -------------------------------------
+
+_TIMEOUT_BUDGET_S = 900.0  # matches the 15m default and the fixture's duration
+
+
+def _completed(events: list) -> CompletedEvent:
+    completed = events[-1]
+    assert isinstance(completed, CompletedEvent)
+    return completed
+
+
+def test_print_timeout_empty_response_maps_to_failure() -> None:
+    evt = _load_fixture("antigravity_timeout_partial.jsonl")
+    completed = _completed(
+        translate_antigravity_result(
+            evt,
+            title="antigravity",
+            state=AntigravityStreamState(),
+            meta=None,
+            resolved_budget_s=_TIMEOUT_BUDGET_S,
+        )
+    )
+    assert completed.ok is False
+    assert completed.error is not None
+    assert "print-timeout" in completed.error
+    assert "900s" in completed.error
+    assert "/printtimeout" in completed.error
+    # resume is still offered so the user can pick the conversation back up
+    assert completed.resume == ResumeToken(engine=ENGINE, value="test-conv-timeout-900")
+
+
+def test_print_timeout_partial_response_appends_warning() -> None:
+    evt = _decode(
+        {
+            "conversation_id": "c",
+            "status": "SUCCESS",
+            "response": "partial work so far",
+            "duration_seconds": 900.4,
+        }
+    )
+    completed = _completed(
+        translate_antigravity_result(
+            evt,
+            title="antigravity",
+            state=AntigravityStreamState(),
+            meta=None,
+            resolved_budget_s=_TIMEOUT_BUDGET_S,
+        )
+    )
+    assert completed.ok is True
+    assert completed.error is None
+    assert completed.answer.startswith("partial work so far")
+    assert "may be truncated" in completed.answer
+    assert "print-timeout" in completed.answer
+
+
+def test_print_timeout_heuristic_skipped_without_budget() -> None:
+    evt = _load_fixture("antigravity_timeout_partial.jsonl")
+    for kwargs in ({}, {"resolved_budget_s": None}, {"resolved_budget_s": 0}):
+        completed = _completed(
+            translate_antigravity_result(
+                evt,
+                title="antigravity",
+                state=AntigravityStreamState(),
+                meta=None,
+                **kwargs,
+            )
+        )
+        assert completed.ok is True
+        assert completed.error is None
+        assert completed.answer == ""
+
+
+def test_print_timeout_heuristic_skipped_below_threshold() -> None:
+    evt = _decode(
+        {
+            "conversation_id": "c",
+            "status": "SUCCESS",
+            "response": "",
+            "duration_seconds": 120.0,
+        }
+    )
+    completed = _completed(
+        translate_antigravity_result(
+            evt,
+            title="antigravity",
+            state=AntigravityStreamState(),
+            meta=None,
+            resolved_budget_s=_TIMEOUT_BUDGET_S,
+        )
+    )
+    assert completed.ok is True
+    assert completed.error is None
+    assert completed.answer == ""
+
+
+def test_print_timeout_heuristic_leaves_error_envelope_untouched() -> None:
+    evt = _decode(
+        {
+            "status": "ERROR",
+            "response": "",
+            "error": "quota exhausted",
+            "duration_seconds": 900.4,
+        }
+    )
+    completed = _completed(
+        translate_antigravity_result(
+            evt,
+            title="antigravity",
+            state=AntigravityStreamState(),
+            meta=None,
+            resolved_budget_s=_TIMEOUT_BUDGET_S,
+        )
+    )
+    assert completed.ok is False
+    assert completed.error == "quota exhausted"
+
+
+def test_runner_translate_wires_resolved_print_timeout_budget() -> None:
+    runner = AntigravityRunner(print_timeout="1m")
+    evt = _decode(
+        {
+            "conversation_id": "c",
+            "status": "SUCCESS",
+            "response": "",
+            "duration_seconds": 60.2,
+        }
+    )
+    completed = _completed(
+        runner.translate(
+            evt, state=AntigravityStreamState(), resume=None, found_session=None
+        )
+    )
+    assert completed.ok is False
+    assert completed.error is not None
+    assert "print-timeout (60s)" in completed.error
+
+
+def test_runner_translate_uses_per_run_print_timeout_override() -> None:
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    # Instance default (1m) would flag a 90s run; the per-run /printtimeout
+    # override (30m) must win, so the run is treated as a normal completion.
+    runner = AntigravityRunner(print_timeout="1m")
+    evt = _decode(
+        {
+            "conversation_id": "c",
+            "status": "SUCCESS",
+            "response": "",
+            "duration_seconds": 90.0,
+        }
+    )
+    with apply_run_options(EngineRunOptions(print_timeout="30m")):
+        completed = _completed(
+            runner.translate(
+                evt, state=AntigravityStreamState(), resume=None, found_session=None
+            )
+        )
+    assert completed.ok is True
+    assert completed.error is None
+
+
 # --- build_args -----------------------------------------------------------
 
 def test_build_args_fresh() -> None:

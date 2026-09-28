@@ -52,6 +52,12 @@ ENGINE: EngineId = "antigravity"
 # [antigravity] print_timeout) so long tasks aren't cut off mid-run. Go duration syntax.
 _DEFAULT_PRINT_TIMEOUT = "15m"
 
+# Slack (seconds) when comparing an envelope's duration_seconds to the resolved
+# --print-timeout: agy's own timer and its reported duration won't line up exactly.
+_PRINT_TIMEOUT_TOLERANCE_S = 5.0
+
+_TRUNCATION_WARNING = "\n\n⚠️ response may be truncated — print-timeout expired mid-turn"
+
 # Max chars of a malformed stdout line surfaced to the user (full line is logged).
 _INVALID_JSON_EXCERPT = 500
 
@@ -129,6 +135,7 @@ def translate_antigravity_result(
     state: AntigravityStreamState,
     meta: dict[str, Any] | None,
     resume_fallback: ResumeToken | None = None,
+    resolved_budget_s: float | None = None,
 ) -> list[UntetherEvent]:
     """Translate the single agy result envelope into Started + Completed events.
 
@@ -178,12 +185,32 @@ def translate_antigravity_result(
     error: str | None = None
     if not ok:
         error = evt.error or f"agy status: {evt.status or 'unknown'}"
+    # On --print-timeout expiry agy exits 0 with status SUCCESS and a partial (often
+    # empty) response; the envelope has no truncation flag, so infer it from the
+    # reported duration reaching the resolved budget.
+    truncated = bool(
+        ok
+        and resolved_budget_s
+        and evt.duration_seconds is not None
+        and evt.duration_seconds >= resolved_budget_s - _PRINT_TIMEOUT_TOLERANCE_S
+    )
+    if truncated:
+        if not answer.strip():
+            ok = False
+            error = (
+                f"agy --print-timeout ({resolved_budget_s:.0f}s) expired before any "
+                "output; consider raising it with /printtimeout"
+            )
+        else:
+            answer = answer + _TRUNCATION_WARNING
+            state.last_text = answer
     logger.info(
         "antigravity.completed",
         conversation_id=state.session_id,
         status=evt.status,
         ok=ok,
         answer_len=len(answer),
+        print_timeout_truncated=truncated,
     )
     out.append(
         CompletedEvent(
@@ -348,6 +375,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             state=state,
             meta=self._meta(),
             resume_fallback=found_session or resume,
+            resolved_budget_s=self.expected_silence_budget_s(),
         )
 
     def decode_jsonl(
